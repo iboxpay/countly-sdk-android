@@ -18,9 +18,9 @@ android {
         minSdkVersion 15
         targetSdkVersion 28
         versionCode 1
-        versionName "19.08"
+        versionName "20.04"
 
-        testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
     }
 
@@ -38,8 +38,8 @@ dependencies {
     implementation fileTree(dir: 'libs', include: ['*.jar'])
 
     testImplementation 'junit:junit:4.12'
-    androidTestImplementation 'com.android.support.test:runner:1.0.2'
-    androidTestImplementation 'com.android.support.test.espresso:espresso-core:3.0.2'
+    androidTestImplementation 'androidx.test:runner:1.2.0'
+    androidTestImplementation 'androidx.test.espresso:espresso-core:3.2.0'
 }
 
 task copyLibs(type: Copy) {
@@ -57,7 +57,7 @@ publish {
     userOrg = 'countly'
     groupId = 'ly.count.android'
     artifactId = 'sdk-native'
-    publishVersion = '19.08'
+    publishVersion = '20.04'
     desc = 'Countly Android Native Crash Support'
     website = 'https://github.com/Countly/countly-sdk-android'
     autoPublish = false

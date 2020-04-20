@@ -1,6 +1,7 @@
 package ly.count.android.demo;
 
 import android.app.Activity;
+import android.content.res.Configuration;
 import android.os.Bundle;
 import android.view.View;
 
@@ -73,11 +74,18 @@ public class ActivityExampleCustomEvents extends Activity {
     }
 
     public void onClickRecordEvent09(View v) {
+        //start timed event
         Countly.sharedInstance().startEvent("Custom event 9");
     }
 
     public void onClickRecordEvent10(View v) {
+        //stop timed event
         Countly.sharedInstance().endEvent("Custom event 9");
+    }
+
+    public void onClickRecordEvent12(View v) {
+        //cancel timed event
+        Countly.sharedInstance().events().cancelEvent("Custom event 9");
     }
 
     public void onClickRecordEvent11(View v) {
@@ -98,5 +106,11 @@ public class ActivityExampleCustomEvents extends Activity {
     {
         Countly.sharedInstance().onStop();
         super.onStop();
+    }
+
+    @Override
+    public void onConfigurationChanged (Configuration newConfig){
+        super.onConfigurationChanged(newConfig);
+        Countly.sharedInstance().onConfigurationChanged(newConfig);
     }
 }

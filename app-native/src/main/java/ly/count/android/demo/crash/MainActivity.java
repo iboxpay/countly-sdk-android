@@ -1,14 +1,17 @@
 package ly.count.android.demo.crash;
 
 import android.content.Context;
-import android.support.v7.app.AppCompatActivity;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.View;
 import android.widget.Button;
 import android.widget.TextView;
 
+import androidx.appcompat.app.AppCompatActivity;
+
 import ly.count.android.sdk.Countly;
+import ly.count.android.sdk.CountlyConfig;
+import ly.count.android.sdk.DeviceId;
 import ly.count.android.sdknative.CountlyNative;
 
 public class MainActivity extends AppCompatActivity {
@@ -35,11 +38,12 @@ public class MainActivity extends AppCompatActivity {
         //init countly
         Context appC = getApplicationContext();
 
-        Countly.sharedInstance().setLoggingEnabled(true);
-        Countly.sharedInstance().enableCrashReporting();
-        Countly.sharedInstance().setViewTracking(false);
-        Countly.sharedInstance().setRequiresConsent(false);
-        Countly.sharedInstance().init(appC, COUNTLY_SERVER_URL, COUNTLY_APP_KEY, "4432");
+        CountlyConfig config = (new CountlyConfig(appC, COUNTLY_APP_KEY, COUNTLY_SERVER_URL)).setDeviceId("4432")
+                .setLoggingEnabled(true)
+                .enableCrashReporting()
+                .setViewTracking(false)
+                .setRequiresConsent(false);
+        Countly.sharedInstance().init(config);
 
         Countly.onCreate(this);
 

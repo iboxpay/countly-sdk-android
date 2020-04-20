@@ -3,6 +3,7 @@ package ly.count.android.demo;
 import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
+import android.content.res.Configuration;
 import android.os.Bundle;
 import android.view.View;
 import android.widget.Toast;
@@ -39,7 +40,7 @@ public class MainActivity extends Activity {
     }
 
     public void onClickButtonAPM(View v) {
-        //
+        startActivity(new Intent(this, ActivityExampleAPM.class));
     }
 
     public void onClickButtonViewTracking(View v) {
@@ -56,6 +57,14 @@ public class MainActivity extends Activity {
 
     public void onClickButtonRemoteConfig(View v) {
         startActivity(new Intent(this, ActivityExampleRemoteConfig.class));
+    }
+
+    public void onClickButtonDeviceId(View v) {
+        startActivity(new Intent(this, ActivityExampleDeviceId.class));
+    }
+
+    public void onClickButtonRatings(View v) {
+        startActivity(new Intent(this, ActivityExampleRatings.class));
     }
 
 
@@ -80,6 +89,12 @@ public class MainActivity extends Activity {
     {
         Countly.sharedInstance().onStop();
         super.onStop();
+    }
+
+    @Override
+    public void onConfigurationChanged (Configuration newConfig){
+        super.onConfigurationChanged(newConfig);
+        Countly.sharedInstance().onConfigurationChanged(newConfig);
     }
 
 }

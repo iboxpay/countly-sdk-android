@@ -31,11 +31,9 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
-import java.io.UnsupportedEncodingException;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLConnection;
-import java.security.MessageDigest;
 import java.util.Map;
 
 import javax.net.ssl.HttpsURLConnection;
@@ -61,6 +59,12 @@ public class ConnectionProcessor implements Runnable {
 
     protected static String salt;
 
+    private enum RequestResult {
+        OK,         // success
+        RETRY,      // retry MAX_RETRIES_BEFORE_SLEEP before switching to SLEEP
+        REMOVE      // bad request, remove
+    }
+
     ConnectionProcessor(final String serverURL, final CountlyStore store, final DeviceId deviceId, final SSLContext sslContext, final Map<String, String> requestHeaderCustomValues) {
         serverURL_ = serverURL;
         store_ = store;
@@ -75,9 +79,9 @@ public class ConnectionProcessor implements Runnable {
         String urlStr = serverURL_ + urlEndpoint;
         if(!requestData.contains("&crash=") && requestData.length() < 2048) {
             urlStr += requestData;
-            urlStr += "&checksum=" + sha1Hash(requestData + salt);
+            urlStr += "&checksum=" + UtilsNetworking.sha1Hash(requestData + salt);
         } else {
-            urlStr += "checksum=" + sha1Hash(requestData + salt);
+            urlStr += "checksum=" + UtilsNetworking.sha1Hash(requestData + salt);
         }
         final URL url = new URL(urlStr);
         final HttpURLConnection conn;
@@ -182,13 +186,15 @@ public class ConnectionProcessor implements Runnable {
     public void run() {
         while (true) {
             final String[] storedEvents = store_.connections();
-            if (storedEvents == null || storedEvents.length == 0) {
-                // currently no data to send, we are done for now
-                break;
-            }
+            int storedEventCount = storedEvents == null ? 0 : storedEvents.length;
 
             if (Countly.sharedInstance().isLoggingEnabled()) {
-                Log.i(Countly.TAG, "[Connection Processor] Starting run, there are [" + storedEvents.length + "] requests stored");
+                Log.i(Countly.TAG, "[Connection Processor] Starting to run, there are [" + storedEventCount + "] requests stored");
+            }
+
+            if (storedEvents == null || storedEventCount == 0) {
+                // currently no data to send, we are done for now
+                break;
             }
 
             // get first event from collection
@@ -201,15 +207,17 @@ public class ConnectionProcessor implements Runnable {
                 break;
             }
 
-            String temporaryIdTag = "&override_id=" + DeviceId.temporaryCountlyDeviceId;
-            boolean containsTemporaryIdOverride = storedEvents[0].contains(temporaryIdTag);
-            if(containsTemporaryIdOverride || deviceId_.temporaryIdModeEnabled()){
+            String temporaryIdOverrideTag = "&override_id=" + DeviceId.temporaryCountlyDeviceId;
+            String temporaryIdTag = "&device_id=" + DeviceId.temporaryCountlyDeviceId;
+            boolean containsTemporaryIdOverride = storedEvents[0].contains(temporaryIdOverrideTag);
+            boolean containsTemporaryId = storedEvents[0].contains(temporaryIdTag);
+            if(containsTemporaryIdOverride || containsTemporaryId || deviceId_.temporaryIdModeEnabled()){
                 //we are about to change ID to the temporary one or
                 //the internally set id is the temporary one
 
                 //abort and wait for exiting temporary mode
                 if (Countly.sharedInstance().isLoggingEnabled()) {
-                    Log.i(Countly.TAG, "[Connection Processor] Temporary ID detected, stalling requests. Id override:[" + containsTemporaryIdOverride + "], temp ID set:[" + deviceId_.temporaryIdModeEnabled() + "]");
+                    Log.i(Countly.TAG, "[Connection Processor] Temporary ID detected, stalling requests. Id override:[" + containsTemporaryIdOverride + "], tmp id tag:[" + containsTemporaryId + "], temp ID set:[" + deviceId_.temporaryIdModeEnabled() + "]");
                 }
                 break;
             }
@@ -236,7 +244,7 @@ public class ConnectionProcessor implements Runnable {
                     // and a device_id merge on server has to be performed
 
                     final int endOfDeviceIdTag = storedEvents[0].indexOf("&device_id=") + "&device_id=".length();
-                    newId = ConnectionProcessor.urlDecodeString(storedEvents[0].substring(endOfDeviceIdTag));
+                    newId = UtilsNetworking.urlDecodeString(storedEvents[0].substring(endOfDeviceIdTag));
 
                     if (newId.equals(deviceId_.getId())) {
                         // If the new device_id is the same as previous,
@@ -267,7 +275,7 @@ public class ConnectionProcessor implements Runnable {
                     // This just adds the device_id to them
 
                     newId = null;
-                    eventData = storedEvents[0] + "&device_id=" + ConnectionProcessor.urlEncodeString(deviceId_.getId());
+                    eventData = storedEvents[0] + "&device_id=" + UtilsNetworking.urlEncodeString(deviceId_.getId());
                 }
             }
 
@@ -297,48 +305,95 @@ public class ConnectionProcessor implements Runnable {
             if(!(Countly.sharedInstance().isDeviceAppCrawler() && Countly.sharedInstance().ifShouldIgnoreCrawlers())) {
                 //continue with sending the request to the server
                 URLConnection conn = null;
+                InputStream connInputStream = null;
                 try {
                     // initialize and open connection
                     conn = urlConnectionForServerRequest(eventData, null);
                     conn.connect();
 
-                    // response code has to be 2xx to be considered a success
-                    boolean success = true;
-                    final int responseCode;
+                    int responseCode = 0;
+                    String responseString = "";
                     if (conn instanceof HttpURLConnection) {
                         final HttpURLConnection httpConn = (HttpURLConnection) conn;
+
+                        try {
+                            //assume there will be no error
+                            connInputStream = httpConn.getInputStream();
+                        } catch (Exception ex){
+                            //in case of exception, assume there was a error in the request and change streams
+                            connInputStream = httpConn.getErrorStream();
+                        }
+
                         responseCode = httpConn.getResponseCode();
-                        success = responseCode >= 200 && responseCode < 300;
-
-                        if (!success && Countly.sharedInstance().isLoggingEnabled()) {
-                            Log.w(Countly.TAG, "[Connection Processor] HTTP error response code was " + responseCode + " from submitting event data: " + eventData);
-                        }
-                    } else {
-                        responseCode = 0;
+                        responseString = Utils.inputStreamToString(connInputStream);
                     }
 
-                    // HTTP response code was good, check response JSON contains {"result":"Success"}
-                    if (success) {
-                        if (Countly.sharedInstance().isLoggingEnabled()) {
-                            Log.d(Countly.TAG, "[Connection Processor] ok ->" + eventData);
-                        }
-
-                        // successfully submitted event data to Count.ly server, so remove
-                        // this one from the stored events collection
-                        store_.removeConnection(storedEvents[0]);
-
-                        if (deviceIdChange) {
-                            deviceId_.changeToDeveloperProvidedId(store_, newId);
-                        }
-                    } else if (responseCode >= 400 && responseCode < 500) {
-                        if (Countly.sharedInstance().isLoggingEnabled()) {
-                            Log.d(Countly.TAG, "[Connection Processor] fail " + responseCode + " ->" + eventData);
-                        }
-                        store_.removeConnection(storedEvents[0]);
-                    } else {
-                        // warning was logged above, stop processing, let next tick take care of retrying
-                        break;
+                    if (Countly.sharedInstance().isLoggingEnabled()) {
+                        Log.d(Countly.TAG, "[Connection Processor] code:[" + responseCode + "], response:[" + responseString + "], request: " + eventData);
                     }
+
+                    final RequestResult rRes;
+
+                    if (responseCode >= 200 && responseCode < 300) {
+                        if (responseString.isEmpty()) {
+                            if (Countly.sharedInstance().isLoggingEnabled()) {
+                                Log.v(Countly.TAG, "[Connection Processor] Response was empty, assuming a success");
+                            }
+                            rRes = RequestResult.OK;
+                        } else if (responseString.contains("Success")) {
+                            if (Countly.sharedInstance().isLoggingEnabled()) {
+                                Log.v(Countly.TAG, "[Connection Processor] Response was a success");
+                            }
+                            rRes = RequestResult.OK;
+                        } else {
+                            if (Countly.sharedInstance().isLoggingEnabled()) {
+                                Log.v(Countly.TAG, "[Connection Processor] Response was a unknown, will retry request");
+                            }
+                            rRes = RequestResult.RETRY;
+                        }
+                    } else if (responseCode >= 300 && responseCode < 400){
+                        //assume redirect
+                        if (Countly.sharedInstance().isLoggingEnabled()) {
+                            Log.v(Countly.TAG, "[Connection Processor] Encountered redirect, will retry");
+                        }
+                        rRes = RequestResult.RETRY;
+                    } else if(responseCode == 400 || responseCode == 404){
+                        if (Countly.sharedInstance().isLoggingEnabled()) {
+                            Log.v(Countly.TAG, "[Connection Processor] Bad request, will be dropped");
+                        }
+                        rRes = RequestResult.REMOVE;
+                    } else if(responseCode > 400){
+                        //server down, try again later
+                        if (Countly.sharedInstance().isLoggingEnabled()) {
+                            Log.v(Countly.TAG, "[Connection Processor] Server is down, will retry");
+                        }
+                        rRes = RequestResult.RETRY;
+                    } else {
+                        if (Countly.sharedInstance().isLoggingEnabled()) {
+                            Log.v(Countly.TAG, "[Connection Processor] Bad response code, will retry");
+                        }
+                        rRes = RequestResult.RETRY;
+                    }
+
+                    switch (rRes){
+                        case OK:
+                            // successfully submitted event data to Count.ly server, so remove
+                            // this one from the stored events collection
+                            store_.removeConnection(storedEvents[0]);
+
+                            if (deviceIdChange) {
+                                deviceId_.changeToDeveloperProvidedId(store_, newId);
+                            }
+                            break;
+                        case REMOVE:
+                            //bad request, will be removed
+                            store_.removeConnection(storedEvents[0]);
+                            break;
+                        case RETRY:
+                            // warning was logged above, stop processing, let next tick take care of retrying
+                            break;
+                    }
+
                 } catch (Exception e) {
                     if (Countly.sharedInstance().isLoggingEnabled()) {
                         Log.w(Countly.TAG, "[Connection Processor] Got exception while trying to submit event data: [" + eventData + "] [" + e + "]");
@@ -347,10 +402,11 @@ public class ConnectionProcessor implements Runnable {
                     break;
                 } finally {
                     // free connection resources
-                    if (conn != null && conn instanceof HttpURLConnection) {
+                    if (conn instanceof HttpURLConnection) {
                         try {
-                            InputStream stream = conn.getInputStream();
-                            stream.close();
+                            if(connInputStream != null) {
+                                connInputStream .close();
+                            }
                         } catch (Throwable ignored){}
 
                         ((HttpURLConnection) conn).disconnect();
@@ -366,61 +422,6 @@ public class ConnectionProcessor implements Runnable {
                 store_.removeConnection(storedEvents[0]);
             }
         }
-    }
-
-    protected static String urlEncodeString(String givenValue){
-        String result = "";
-
-        try {
-            result = java.net.URLEncoder.encode(givenValue, "UTF-8");
-        } catch (UnsupportedEncodingException ignored) {
-            // should never happen because Android guarantees UTF-8 support
-        }
-
-        return result;
-    }
-
-    protected static String urlDecodeString(String givenValue){
-        String decodedResult = "";
-
-        try {
-            decodedResult = java.net.URLDecoder.decode(givenValue, "UTF-8");
-        } catch (UnsupportedEncodingException ignored) {
-            // should never happen because Android guarantees UTF-8 support
-        }
-
-        return decodedResult;
-    }
-
-    protected static String sha1Hash (String toHash) {
-        String hash = null;
-        try {
-            MessageDigest digest = MessageDigest.getInstance( "SHA-1" );
-            byte[] bytes = toHash.getBytes("UTF-8");
-            digest.update(bytes, 0, bytes.length);
-            bytes = digest.digest();
-
-            // This is ~55x faster than looping and String.formating()
-            hash = bytesToHex( bytes );
-        }
-        catch( Throwable e ) {
-            if (Countly.sharedInstance().isLoggingEnabled()) {
-                Log.e(Countly.TAG, "Cannot tamper-protect params", e);
-            }
-        }
-        return hash;
-    }
-
-    // http://stackoverflow.com/questions/9655181/convert-from-byte-array-to-hex-string-in-java
-    final private static char[] hexArray = "0123456789ABCDEF".toCharArray();
-    public static String bytesToHex( byte[] bytes ) {
-        char[] hexChars = new char[ bytes.length * 2 ];
-        for( int j = 0; j < bytes.length; j++ ) {
-            int v = bytes[ j ] & 0xFF;
-            hexChars[ j * 2 ] = hexArray[ v >>> 4 ];
-            hexChars[ j * 2 + 1 ] = hexArray[ v & 0x0F ];
-        }
-        return new String( hexChars ).toLowerCase();
     }
 
     // for unit testing

@@ -58,8 +58,8 @@ class CrashDetails {
     private static final int maxBreadcrumbLimit = 1000;//the limit of how many breadcrumbs can be saved
     private static final int maxBreadcrumbSize = 1000;//maximum allowed length of a breadcrumb in characters
     private static final LinkedList<String> logs = new LinkedList<>();
-    private static final int startTime = Countly.currentTimestamp();
-    private static Map<String,String> customSegments = null;
+    private static final int startTime = UtilsTime.currentTimestampSeconds();
+    static Map<String,Object> customSegments = null;
     private static boolean inBackground = true;
     private static long totalMemory = 0;
 
@@ -167,21 +167,40 @@ class CrashDetails {
      * Adds developer provided custom segments for crash,
      * like versions of dependency libraries.
      */
-    static void setCustomSegments(Map<String,String> segments) {
+    static void setCustomSegments(Map<String,Object> segments) {
         customSegments = new HashMap<>();
+
+        for (Map.Entry<String, Object> pair : segments.entrySet()) {
+            String key = pair.getKey();
+            Object value = pair.getValue();
+
+            if (value instanceof Integer) {
+                customSegments.put(key, (Integer) value);
+            } else if (value instanceof Double) {
+                customSegments.put(key, (Double) value);
+            } else if (value instanceof String) {
+                customSegments.put(key, (String) value);
+            } else if (value instanceof Boolean) {
+                customSegments.put(key, (Boolean) value);
+            } else {
+                if(Countly.sharedInstance().isLoggingEnabled()){
+                    Log.w(Countly.TAG, "Unsupported data type added as custom crash segment");
+                }
+            }
+        }
+
         customSegments.putAll(segments);
     }
 
     /**
      * Get custom segments json string
      */
-    static JSONObject getCustomSegments() {
+    static JSONObject getCustomSegmentsJson() {
         if(customSegments != null && !customSegments.isEmpty())
             return new JSONObject(customSegments);
         else
             return null;
     }
-
 
     /**
      * Returns the current device manufacturer.
@@ -294,7 +313,7 @@ class CrashDetails {
         }
         catch(Exception e){
             if (Countly.sharedInstance().isLoggingEnabled()) {
-                Log.i(Countly.TAG, "Can't get batter level");
+                Log.i(Countly.TAG, "Can't get battery level");
             }
         }
 
@@ -305,7 +324,7 @@ class CrashDetails {
      * Get app's running time before crashing.
      */
     static String getRunningTime() {
-        return Integer.toString(Countly.currentTimestamp() - startTime);
+        return Integer.toString(UtilsTime.currentTimestampSeconds() - startTime);
     }
 
     /**
@@ -366,14 +385,18 @@ class CrashDetails {
      * Checks if device is muted.
      */
     static String isMuted(Context context) {
-        AudioManager audio = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
-        switch( audio.getRingerMode() ){
-            case AudioManager.RINGER_MODE_SILENT:
-                return "true";
-            case AudioManager.RINGER_MODE_VIBRATE:
-                return "true";
-            default:
-                return "false";
+        try {
+            AudioManager audio = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+            switch (audio.getRingerMode()){
+                case AudioManager.RINGER_MODE_SILENT:
+                    // Fall-through
+                case AudioManager.RINGER_MODE_VIBRATE:
+                    return "true";
+                default:
+                    return "false";
+            }
+        } catch (Throwable thr) {
+            return "false";
         }
     }
 
@@ -422,7 +445,7 @@ class CrashDetails {
         }
 
         try {
-            json.put("_custom", getCustomSegments());
+            json.put("_custom", getCustomSegmentsJson());
         } catch (JSONException e) {
             //no custom segments
         }

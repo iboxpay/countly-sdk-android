@@ -1,10 +1,11 @@
 package ly.count.android.demo;
 
+import android.content.res.Configuration;
 import android.os.Bundle;
-import android.support.design.widget.FloatingActionButton;
-import android.support.design.widget.Snackbar;
-import android.support.v7.app.AppCompatActivity;
-import android.support.v7.widget.Toolbar;
+import com.google.android.material.floatingactionbutton.FloatingActionButton;
+import com.google.android.material.snackbar.Snackbar;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.appcompat.widget.Toolbar;
 import android.view.View;
 
 import ly.count.android.sdk.Countly;
@@ -40,5 +41,11 @@ public class AnotherActivity extends AppCompatActivity {
     protected void onStop() {
         super.onStop();
         Countly.sharedInstance().onStop();
+    }
+
+    @Override
+    public void onConfigurationChanged (Configuration newConfig){
+        super.onConfigurationChanged(newConfig);
+        Countly.sharedInstance().onConfigurationChanged(newConfig);
     }
 }

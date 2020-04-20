@@ -21,8 +21,12 @@ THE SOFTWARE.
 */
 package ly.count.android.sdk;
 
+import android.app.Instrumentation;
 import android.net.Uri;
-import android.support.test.runner.AndroidJUnit4;
+import android.os.Bundle;
+
+import androidx.test.ext.junit.runners.AndroidJUnit4;
+import androidx.test.platform.app.InstrumentationRegistry;
 
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -39,7 +43,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
-import static android.support.test.InstrumentationRegistry.getContext;
+import static androidx.test.InstrumentationRegistry.getContext;
 import static org.junit.Assert.*;
 import static org.mockito.Mockito.*;
 
@@ -55,12 +59,15 @@ public class ConnectionQueueTests {
 
     @Before
     public void setUp() {
+        Countly.sharedInstance().setLoggingEnabled(true);
         freshConnQ = new ConnectionQueue();
         connQ = new ConnectionQueue();
         connQ.setAppKey("abcDeFgHiJkLmNoPQRstuVWxyz");
         connQ.setServerURL("http://countly.coupons.com");
         connQ.setContext(getContext());
-        connQ.setCountlyStore(mock(CountlyStore.class));
+        CountlyStore cs = mock(CountlyStore.class);
+        when(cs.getCachedAdvertisingId()).thenReturn("");
+        connQ.setCountlyStore(cs);
         connQ.setDeviceId(mock(DeviceId.class));
         connQ.setExecutor(mock(ExecutorService.class));
     }
@@ -199,8 +206,7 @@ public class ConnectionQueueTests {
         }
     }
 
-    //todo fix test, problem while mocking
-    /*
+    @Test
     public void testBeginSession() throws JSONException, UnsupportedEncodingException {
         connQ.beginSession();
         final ArgumentCaptor<String> arg = ArgumentCaptor.forClass(String.class);
@@ -212,10 +218,10 @@ public class ConnectionQueueTests {
         final Map<String, String> queryParams = parseQueryParams(queryStr);
         assertEquals(connQ.getAppKey(), queryParams.get("app_key"));
         assertNull(queryParams.get("device_id"));
-        final long curTimestamp = Countly.currentTimestampMs();
+        final long curTimestamp = UtilsTime.currentTimestampMs();
         final long actualTimestamp = Long.parseLong(queryParams.get("timestamp"));
         // this check attempts to account for minor time changes during this test
-        assertTrue(((curTimestamp-1) <= actualTimestamp) && ((curTimestamp+1) >= actualTimestamp));
+        assertTrue(((curTimestamp-400) <= actualTimestamp) && ((curTimestamp+400) >= actualTimestamp));
         assertEquals(Countly.COUNTLY_SDK_VERSION_STRING, queryParams.get("sdk_version"));
         assertEquals("1", queryParams.get("begin_session"));
         // validate metrics
@@ -229,7 +235,6 @@ public class ConnectionQueueTests {
             assertEquals(expectedMetrics.get(key), actualMetrics.get(key));
         }
     }
-    */
 
     @Test
     public void testUpdateSession_checkInternalState() {
@@ -253,8 +258,7 @@ public class ConnectionQueueTests {
         verifyZeroInteractions(connQ.getExecutor(), connQ.getCountlyStore());
     }
 
-    //todo fix test, problem while mocking
-    /*
+    @Test
     public void testUpdateSession_moreThanZeroDuration() {
         connQ.updateSession(60);
         final ArgumentCaptor<String> arg = ArgumentCaptor.forClass(String.class);
@@ -266,13 +270,12 @@ public class ConnectionQueueTests {
         final Map<String, String> queryParams = parseQueryParams(queryStr);
         assertEquals(connQ.getAppKey(), queryParams.get("app_key"));
         assertNull(queryParams.get("device_id"));
-        final long curTimestamp = Countly.currentTimestampMs();
+        final long curTimestamp = UtilsTime.currentTimestampMs();
         final long actualTimestamp = Long.parseLong(queryParams.get("timestamp"));
         // this check attempts to account for minor time changes during this test
-        assertTrue(((curTimestamp-1) <= actualTimestamp) && ((curTimestamp+1) >= actualTimestamp));
+        assertTrue(((curTimestamp-400) <= actualTimestamp) && ((curTimestamp+400) >= actualTimestamp));
         assertEquals("60", queryParams.get("session_duration"));
     }
-    */
 
     @Test
     public void testEndSession_checkInternalState() {
@@ -296,7 +299,7 @@ public class ConnectionQueueTests {
         final Map<String, String> queryParams = parseQueryParams(queryStr);
         assertEquals(connQ.getAppKey(), queryParams.get("app_key"));
         assertNull(queryParams.get("device_id"));
-        final long curTimestamp = Countly.currentTimestampMs();
+        final long curTimestamp = UtilsTime.currentTimestampMs();
         final long curTimestampBelow = curTimestamp - timestampAllowance;
         final long curTimestampAbove = curTimestamp + timestampAllowance;
         final long actualTimestamp = Long.parseLong(queryParams.get("timestamp"));
@@ -318,7 +321,7 @@ public class ConnectionQueueTests {
         final Map<String, String> queryParams = parseQueryParams(queryStr);
         assertEquals(connQ.getAppKey(), queryParams.get("app_key"));
         assertNull(queryParams.get("device_id"));
-        final long curTimestamp = Countly.currentTimestampMs();
+        final long curTimestamp = UtilsTime.currentTimestampMs();
         final long curTimestampBelow = curTimestamp - timestampAllowance;
         final long curTimestampAbove = curTimestamp + timestampAllowance;
         final long actualTimestamp = Long.parseLong(queryParams.get("timestamp"));
@@ -340,7 +343,7 @@ public class ConnectionQueueTests {
         final Map<String, String> queryParams = parseQueryParams(queryStr);
         assertEquals(connQ.getAppKey(), queryParams.get("app_key"));
         assertNull(queryParams.get("device_id"));
-        final long curTimestamp = Countly.currentTimestampMs();
+        final long curTimestamp = UtilsTime.currentTimestampMs();
         final long curTimestampBelow = curTimestamp - timestampAllowance;
         final long curTimestampAbove = curTimestamp + timestampAllowance;
         final long actualTimestamp = Long.parseLong(queryParams.get("timestamp"));
@@ -373,7 +376,7 @@ public class ConnectionQueueTests {
         final Map<String, String> queryParams = parseQueryParams(queryStr);
         assertEquals(connQ.getAppKey(), queryParams.get("app_key"));
         assertNull(queryParams.get("device_id"));
-        final long curTimestamp = Countly.currentTimestampMs();
+        final long curTimestamp = UtilsTime.currentTimestampMs();
         final long curTimestampBelow = curTimestamp - timestampAllowance;
         final long curTimestampAbove = curTimestamp + timestampAllowance;
         final long actualTimestamp = Long.parseLong(queryParams.get("timestamp"));

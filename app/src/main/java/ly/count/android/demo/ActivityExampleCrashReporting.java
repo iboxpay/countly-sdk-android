@@ -1,6 +1,7 @@
 package ly.count.android.demo;
 
 import android.app.Activity;
+import android.content.res.Configuration;
 import android.os.Bundle;
 import android.view.View;
 
@@ -45,7 +46,9 @@ public class ActivityExampleCrashReporting extends Activity {
 
     public void onClickCrashReporting03(View v) {
         Countly.sharedInstance().addCrashBreadcrumb("Null pointer crash");
-        Countly.sharedInstance().crashTest(3);
+
+        Object[] o = null;
+        o[0].getClass();
     }
 
     public void onClickCrashReporting04(View v) {
@@ -65,7 +68,9 @@ public class ActivityExampleCrashReporting extends Activity {
     public void onClickCrashReporting07(View v) {
         Countly.sharedInstance().addCrashBreadcrumb("Custom crash log crash");
         Countly.sharedInstance().addCrashBreadcrumb("Adding some custom crash log");
-        Countly.sharedInstance().crashTest(2);
+
+        //noinspection UnusedAssignment,divzero
+        @SuppressWarnings("NumericOverflow") int test = 10/0;
     }
 
     public void onClickCrashReporting08(View v) {
@@ -124,5 +129,11 @@ public class ActivityExampleCrashReporting extends Activity {
     {
         Countly.sharedInstance().onStop();
         super.onStop();
+    }
+
+    @Override
+    public void onConfigurationChanged (Configuration newConfig){
+        super.onConfigurationChanged(newConfig);
+        Countly.sharedInstance().onConfigurationChanged(newConfig);
     }
 }

@@ -23,22 +23,19 @@ package ly.count.android.sdk;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.app.Application;
+import android.content.ComponentCallbacks;
 import android.content.Context;
 import android.content.Intent;
+import android.content.res.Configuration;
 import android.net.Uri;
-import android.util.Base64;
+import android.os.Bundle;
 import android.util.Log;
 
-import java.io.BufferedInputStream;
-import java.io.File;
-import java.io.FileInputStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
-import java.net.MalformedURLException;
-import java.net.URL;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Calendar;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -46,9 +43,8 @@ import java.util.HashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-
-import static ly.count.android.sdk.CountlyStarRating.STAR_RATING_EVENT_KEY;
 
 /**
  * This class is the public API for the Countly Android SDK.
@@ -60,7 +56,7 @@ public class Countly {
     /**
      * Current version of the Count.ly Android SDK as a displayable string.
      */
-    public static final String COUNTLY_SDK_VERSION_STRING = "19.08";
+    public static final String COUNTLY_SDK_VERSION_STRING = "20.04";
     /**
      * Used as request meta data on every request
      */
@@ -93,8 +89,6 @@ public class Countly {
     protected static List<String> publicKeyPinCertificates;
     protected static List<String> certificatePinCertificates;
 
-    protected static final Map<String, Event> timedEvents = new HashMap<>();
-
     /**
      * Enum used in Countly.initMessaging() method which controls what kind of
      * app installation it is. Later (in Countly Dashboard or when calling Countly API method),
@@ -112,26 +106,37 @@ public class Countly {
         static final Countly instance = new Countly();
     }
 
-    private ConnectionQueue connectionQueue_;
-    @SuppressWarnings("FieldCanBeLocal")
+    ConnectionQueue connectionQueue_;
     private final ScheduledExecutorService timerService_;
-    private EventQueue eventQueue_;
-    private long prevSessionDurationStartTime_;
+    private ScheduledFuture<?> timerFuture = null;
+    EventQueue eventQueue_;
     private int activityCount_;
-    private boolean disableUpdateSessionRequests_;
+    boolean disableUpdateSessionRequests_ = false;//todo, move to module after 'setDisableUpdateSessionRequests' is removed
     private boolean enableLogging_;
     private Countly.CountlyMessagingMode messagingMode_;
-    private Context context_;
+    Context context_;
+
+    //Internal modules for functionality grouping
+    List<ModuleBase> modules = new ArrayList<>();
+    ModuleCrash moduleCrash = null;
+    ModuleEvents moduleEvents = null;
+    ModuleViews moduleViews = null;
+    ModuleRatings moduleRatings = null;
+    ModuleSessions moduleSessions = null;
+    ModuleRemoteConfig moduleRemoteConfig = null;
+    ModuleAPM moduleAPM = null;
+    ModuleConsent moduleConsent = null;
 
     //user data access
     public static UserData userData;
 
-    //track views
-    private String lastView = null;
-    private int lastViewStart = 0;
-    private boolean firstView = true;
-    private boolean autoViewTracker = false;
-    private final static String VIEW_EVENT_KEY = "[CLY]_view";
+    //view related things
+    boolean autoViewTracker = false;//todo, move to module after "setViewTracking" is removed
+    boolean automaticTrackingShouldUseShortName = false;//flag for using short names | todo, move to module after setter is removed
+
+    //if set to true, it will automatically download remote configs on module startup
+    boolean remoteConfigAutomaticUpdateEnabled = false;//todo, move to module after setter is removed
+    RemoteConfigCallback remoteConfigInitCallback = null;//todo, move to module after setter is removed
 
     //overrides
     private boolean isHttpPostForced = false;//when true, all data sent to the server will be sent using HTTP POST
@@ -142,35 +147,21 @@ public class Countly {
     @SuppressWarnings("ArraysAsListWithZeroOrOneArgument")
     private final List<String> appCrawlerNames = new ArrayList<>(Arrays.asList("Calypso AppCrawler"));//List against which device name is checked to determine if device is app crawler
 
-    //star rating
-    @SuppressWarnings("FieldCanBeLocal")
-    private CountlyStarRating.RatingCallback starRatingCallback_;// saved callback that is used for automatic star rating
-
     //push related
     private boolean addMetadataToPushIntents = false;// a flag that indicates if metadata should be added to push notification intents
 
     //internal flags
     private boolean calledAtLeastOnceOnStart = false;//flag for if the onStart function has been called at least once
 
-    //activity tracking
-    boolean automaticTrackingShouldUseShortName = false;//flag for using short names
-
     //attribution
     protected boolean isAttributionEnabled = true;
 
     protected boolean isBeginSessionSent = false;
 
-    //remote config_
-    //if set to true, it will automatically download remote configs on module startup
-    boolean remoteConfigAutomaticUpdateEnabled = false;
-    RemoteConfig.RemoteConfigCallback remoteConfigInitCallback = null;
-
     //custom request header fields
     Map<String, String> requestHeaderCustomValues;
 
-    //native crash
-    static final String countlyFolderName = "Countly";
-    static final String countlyNativeCrashFolderName = "CrashDumps";
+    static long applicationStart = -1;
 
     //GDPR
     protected boolean requiresConsent = false;
@@ -181,6 +172,8 @@ public class Countly {
 
     Boolean delayedPushConsent = null;//if this is set, consent for push has to be set before finishing init and sending push changes
     boolean delayedLocationErasure = false;//if location needs to be cleared at the end of init
+
+    private boolean appLaunchDeepLink = true;
 
     CountlyConfig config_ = null;
 
@@ -201,7 +194,7 @@ public class Countly {
     }
 
     //a list of valid feature names that are used for checking
-    private final String[] validFeatureNames = new String[]{
+    protected final String[] validFeatureNames = new String[]{
             CountlyFeatureNames.sessions,
             CountlyFeatureNames.events,
             CountlyFeatureNames.views,
@@ -227,14 +220,30 @@ public class Countly {
         connectionQueue_ = new ConnectionQueue();
         Countly.userData = new UserData(connectionQueue_);
         timerService_ = Executors.newSingleThreadScheduledExecutor();
-        timerService_.scheduleWithFixedDelay(new Runnable() {
+        startTimerService(timerService_, timerFuture, TIMER_DELAY_IN_SECONDS);
+
+        initConsent();
+    }
+
+    private void startTimerService(ScheduledExecutorService service, ScheduledFuture<?> previousTimer, long timerDelay) {
+        if(previousTimer != null && !previousTimer.isCancelled()){
+            previousTimer.cancel(false);
+        }
+
+        //minimum delay of 1 second
+        //maximum delay if 10 minutes
+        if(timerDelay < 1){
+            timerDelay = 1;
+        } else if(timerDelay > 600) {
+            timerDelay = 600;
+        }
+
+        timerFuture = service.scheduleWithFixedDelay(new Runnable() {
             @Override
             public void run() {
                 onTimer();
             }
-        }, TIMER_DELAY_IN_SECONDS, TIMER_DELAY_IN_SECONDS, TimeUnit.SECONDS);
-
-        initConsent();
+        }, timerDelay, timerDelay, TimeUnit.SECONDS);
     }
 
 
@@ -308,12 +317,26 @@ public class Countly {
      * @deprecated use {@link CountlyConfig} to pass data to init.
      */
     public synchronized Countly init(final Context context, String serverURL, final String appKey, final String deviceID, DeviceId.Type idMode,
-                                     int starRatingLimit, CountlyStarRating.RatingCallback starRatingCallback, String starRatingTextTitle, String starRatingTextMessage, String starRatingTextDismiss) {
+                                     int starRatingLimit, final CountlyStarRating.RatingCallback starRatingCallback, String starRatingTextTitle, String starRatingTextMessage, String starRatingTextDismiss) {
         CountlyConfig config = new CountlyConfig();
         config.setContext(context).setServerURL(serverURL).setAppKey(appKey).setDeviceId(deviceID)
-                .setIdMode(idMode).setStarRatingLimit(starRatingLimit).setStarRatingCallback(starRatingCallback)
                 .setStarRatingTextTitle(starRatingTextTitle).setStarRatingTextMessage(starRatingTextMessage)
-                .setStarRatingTextDismiss(starRatingTextDismiss);
+                .setStarRatingTextDismiss(starRatingTextDismiss)
+                .setIdMode(idMode).setStarRatingSessionLimit(starRatingLimit).setStarRatingCallback(new StarRatingCallback() {
+            @Override
+            public void onRate(int rating) {
+                if(starRatingCallback != null) {
+                    starRatingCallback.onRate(rating);
+                }
+            }
+
+            @Override
+            public void onDismiss() {
+                if(starRatingCallback != null) {
+                    starRatingCallback.onDismiss();
+                }
+            }
+        });
         return init(config);
     }
 
@@ -330,7 +353,7 @@ public class Countly {
             setLoggingEnabled(true);
         }
 
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "[Init] Initializing Countly SDk version " + COUNTLY_SDK_VERSION_STRING);
         }
 
@@ -338,7 +361,7 @@ public class Countly {
             throw new IllegalArgumentException("valid context is required in Countly init, but was provided 'null'");
         }
 
-        if (!isValidURL(config.serverURL)) {
+        if (!UtilsNetworking.isValidURL(config.serverURL)) {
             throw new IllegalArgumentException("valid serverURL is required");
         }
 
@@ -354,7 +377,7 @@ public class Countly {
         }
 
         if (config.serverURL.charAt(config.serverURL.length() - 1) == '/') {
-            if (Countly.sharedInstance().isLoggingEnabled()) {
+            if (isLoggingEnabled()) {
                 Log.i(Countly.TAG, "[Init] Removing trailing '/' from provided server url");
             }
             config.serverURL = config.serverURL.substring(0, config.serverURL.length() - 1);//removing trailing '/' from server url
@@ -388,7 +411,7 @@ public class Countly {
             throw new IllegalStateException("Countly cannot be reinitialized with different values");
         }
 
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "[Init] Checking init parameters");
             Log.d(Countly.TAG, "[Init] Is consent required? [" + requiresConsent + "]");
 
@@ -412,38 +435,6 @@ public class Countly {
             Log.d(Countly.TAG, contextText);
 
         }
-        //init view related things
-        if(config.enableViewTracking){
-            setViewTracking(true);
-        }
-
-        if(config.autoTrackingUseShortName){
-            setAutoTrackingUseShortName(true);
-        }
-
-        //init other things
-        if(config.customNetworkRequestHeaders != null){
-            addCustomNetworkRequestHeaders(config.customNetworkRequestHeaders);
-        }
-
-        if(config.pushIntentAddMetadata){
-            setPushIntentAddMetadata(true);
-        }
-
-        if(config.enableRemoteConfigAutomaticDownload){
-            setRemoteConfigAutomaticDownload(config.enableRemoteConfigAutomaticDownload, config.remoteConfigCallback);
-        }
-
-        if(config.httpPostForced){
-            setHttpPostForced(true);
-        }
-
-        //set the star rating values
-        starRatingCallback_ = config.starRatingCallback;
-        CountlyStarRating.setStarRatingInitConfig(config.context, config.starRatingLimit, config.starRatingTextTitle, config.starRatingTextMessage, config.starRatingTextDismiss);
-
-        //app crawler check
-        checkIfDeviceIsAppCrawler();
 
         //set internal context, it's allowed to be changed on the second init call
         context_ = config.context.getApplicationContext();
@@ -451,12 +442,80 @@ public class Countly {
         // if we get here and eventQueue_ != null, init is being called again with the same values,
         // so there is nothing to do, because we are already initialized with those values
         if (eventQueue_ == null) {
-            if (Countly.sharedInstance().isLoggingEnabled()) {
+            if (isLoggingEnabled()) {
                 Log.d(Countly.TAG, "[Init] About to init internal systems");
             }
 
             config_ = config;
-            final CountlyStore countlyStore = new CountlyStore(config.context);
+
+            if(config.sessionUpdateTimerDelay != null) {
+                //if we need to change the timer delay, do that first
+                startTimerService(timerService_, timerFuture, config.sessionUpdateTimerDelay);
+            }
+
+            final CountlyStore countlyStore;
+            if(config.countlyStore != null){
+                //we are running a test and using a mock object
+                countlyStore = config.countlyStore;
+            } else {
+                countlyStore = new CountlyStore(config.context);
+                config.setCountlyStore(countlyStore);
+            }
+
+            //initialise modules
+            moduleCrash = new ModuleCrash(this, config);
+            moduleEvents = new ModuleEvents(this, config);
+            moduleViews = new ModuleViews(this, config);
+            moduleRatings = new ModuleRatings(this, config);
+            moduleSessions = new ModuleSessions(this, config);
+            moduleRemoteConfig = new ModuleRemoteConfig(this, config);
+            moduleConsent = new ModuleConsent(this, config);
+            moduleAPM = new ModuleAPM(this, config);
+
+            modules.clear();
+            modules.add(moduleCrash);
+            modules.add(moduleEvents);
+            modules.add(moduleViews);
+            modules.add(moduleRatings);
+            modules.add(moduleSessions);
+            modules.add(moduleRemoteConfig);
+            modules.add(moduleConsent);
+            modules.add(moduleAPM);
+
+            //init other things
+            addCustomNetworkRequestHeaders(config.customNetworkRequestHeaders);
+
+            setPushIntentAddMetadata(config.pushIntentAddMetadata);
+
+            setRemoteConfigAutomaticDownload(config.enableRemoteConfigAutomaticDownload, config.remoteConfigCallback);
+
+            setHttpPostForced(config.httpPostForced);
+
+            enableParameterTamperingProtectionInternal(config.tamperingProtectionSalt);
+
+            if(config.eventQueueSizeThreshold != null){
+                setEventQueueSizeToSend(config.eventQueueSizeThreshold);
+            }
+
+            if(config.publicKeyPinningCertificates != null){
+                enablePublicKeyPinning(Arrays.asList(config.publicKeyPinningCertificates));
+            }
+
+            if(config.certificatePinningCertificates != null){
+                enableCertificatePinning(Arrays.asList(config.certificatePinningCertificates));
+            }
+
+            if(config.enableAttribution != null){
+                setEnableAttribution(config.enableAttribution);
+            }
+
+            //app crawler check
+            shouldIgnoreCrawlers = config.shouldIgnoreAppCrawlers;
+            if(config.appCrawlerNames != null){
+                Collections.addAll(Arrays.asList(config.appCrawlerNames));
+            }
+
+            checkIfDeviceIsAppCrawler();
 
             boolean doingTemporaryIdMode = false;
             boolean customIDWasProvided = (config.deviceID != null);
@@ -476,7 +535,7 @@ public class Countly {
                 deviceIdInstance = new DeviceId(countlyStore, config.idMode);
             }
 
-            if (Countly.sharedInstance().isLoggingEnabled()) {
+            if (isLoggingEnabled()) {
                 Log.d(Countly.TAG, "[Init] Currently cached advertising ID [" + countlyStore.getCachedAdvertisingId() + "]");
             }
             AdvertisingIdAdapter.cacheAdvertisingID(config.context, countlyStore);
@@ -484,7 +543,7 @@ public class Countly {
             deviceIdInstance.init(config.context, countlyStore, true);
 
             boolean temporaryDeviceIdWasEnabled = deviceIdInstance.temporaryIdModeEnabled();
-            if (Countly.sharedInstance().isLoggingEnabled()) {
+            if (isLoggingEnabled()) {
                 Log.d(Countly.TAG, "[Init] [TemporaryDeviceId] Previously was enabled: [" + temporaryDeviceIdWasEnabled + "]");
             }
 
@@ -496,14 +555,14 @@ public class Countly {
                     //a custom device ID is explicitly provided
                     //that means we have to exit temporary ID mode
 
-                    if (Countly.sharedInstance().isLoggingEnabled()) {
+                    if (isLoggingEnabled()) {
                         Log.d(Countly.TAG, "[Init] [TemporaryDeviceId] Decided we have to exit temporary device ID mode, mode enabled: [" + config.temporaryDeviceIdEnabled + "], custom Device ID Set: [" + customIDWasProvided + "]");
                     }
                 } else {
                     //we continue to stay in temporary ID mode
                     //no changes need to happen
 
-                    if (Countly.sharedInstance().isLoggingEnabled()) {
+                    if (isLoggingEnabled()) {
                         Log.d(Countly.TAG, "[Init] [TemporaryDeviceId] Decided to stay in temporary ID mode");
                     }
                 }
@@ -513,7 +572,7 @@ public class Countly {
                     //no custom device ID is provided
                     //we can safely enter temporary device ID mode
 
-                    if (Countly.sharedInstance().isLoggingEnabled()) {
+                    if (isLoggingEnabled()) {
                         Log.d(Countly.TAG, "[Init] [TemporaryDeviceId] Decided to enter temporary ID mode");
                     }
                 }
@@ -530,19 +589,19 @@ public class Countly {
             eventQueue_ = new EventQueue(countlyStore);
 
             if(doingTemporaryIdMode) {
-                if (Countly.sharedInstance().isLoggingEnabled()) {
+                if (isLoggingEnabled()) {
                     Log.d(Countly.TAG, "[Init] Trying to enter temporary ID mode");
                 }
                 //if we are doing temporary ID, make sure it is applied
                 //if it's not, change ID to it
                 if(!deviceIdInstance.temporaryIdModeEnabled()){
-                    if (Countly.sharedInstance().isLoggingEnabled()) {
+                    if (isLoggingEnabled()) {
                         Log.d(Countly.TAG, "[Init] Temporary ID mode was not enabled, entering it");
                     }
                     //temporary ID is not set
                     changeDeviceId(DeviceId.temporaryCountlyDeviceId);
                 } else {
-                    if (Countly.sharedInstance().isLoggingEnabled()) {
+                    if (isLoggingEnabled()) {
                         Log.d(Countly.TAG, "[Init] Temporary ID mode was enabled previously, nothing to enter");
                     }
                 }
@@ -551,7 +610,110 @@ public class Countly {
 
             //do star rating related things
             if(getConsent(CountlyFeatureNames.starRating)) {
-                CountlyStarRating.registerAppSession(config.context, starRatingCallback_);
+                moduleRatings.registerAppSession(config.context, countlyStore, moduleRatings.starRatingCallback_);
+            }
+
+            //update remote config_ values if automatic update is enabled and we are not in temporary id mode
+            if(remoteConfigAutomaticUpdateEnabled && anyConsentGiven() && !doingTemporaryIdMode){
+                if (isLoggingEnabled()) {
+                    Log.d(Countly.TAG, "[Init] Automatically updating remote config values");
+                }
+                moduleRemoteConfig.updateRemoteConfigValues(null, null, connectionQueue_, false, remoteConfigInitCallback);
+            }
+
+            //set global application listeners
+            if(config.application != null) {
+                config.application.registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {
+                    @Override
+                    public void onActivityCreated(Activity activity, Bundle bundle) {
+                        if (isLoggingEnabled()) {
+                            String actName = activity.getClass().getSimpleName();
+                            Log.d(Countly.TAG, "[Countly] onActivityCreated, " + actName);
+                        }
+                        for (ModuleBase module:modules) {
+                            module.callbackOnActivityCreated(activity);
+                        }
+                    }
+
+                    @Override
+                    public void onActivityStarted(Activity activity) {
+                        if (isLoggingEnabled()) {
+                            String actName = activity.getClass().getSimpleName();
+                            Log.d(Countly.TAG, "[Countly] onActivityStarted, " + actName);
+                        }
+                        for (ModuleBase module:modules) {
+                            module.callbackOnActivityStarted(activity);
+                        }
+                    }
+
+                    @Override
+                    public void onActivityResumed(Activity activity) {
+                        if (isLoggingEnabled()) {
+                            String actName = activity.getClass().getSimpleName();
+                            Log.d(Countly.TAG, "[Countly] onActivityResumed, " + actName);
+                        }
+                        for (ModuleBase module:modules) {
+                            module.callbackOnActivityResumed(activity);
+                        }
+                    }
+
+                    @Override
+                    public void onActivityPaused(Activity activity) {
+                        if (isLoggingEnabled()) {
+                            String actName = activity.getClass().getSimpleName();
+                            Log.d(Countly.TAG, "[Countly] onActivityPaused, " + actName);
+                        }
+                        for (ModuleBase module:modules) {
+                            module.callbackOnActivityPaused(activity);
+                        }
+                    }
+
+                    @Override
+                    public void onActivityStopped(Activity activity) {
+                        if (isLoggingEnabled()) {
+                            String actName = activity.getClass().getSimpleName();
+                            Log.d(Countly.TAG, "[Countly] onActivityStopped, " + actName);
+                        }
+                        for (ModuleBase module:modules) {
+                            module.callbackOnActivityStopped(activity);
+                        }
+                    }
+
+                    @Override
+                    public void onActivitySaveInstanceState(Activity activity, Bundle bundle) {
+                        if (isLoggingEnabled()) {
+                            String actName = activity.getClass().getSimpleName();
+                            Log.d(Countly.TAG, "[Countly] onActivitySaveInstanceState, " + actName);
+                        }
+                        for (ModuleBase module:modules) {
+                            module.callbackOnActivitySaveInstanceState(activity);
+                        }
+                    }
+
+                    @Override
+                    public void onActivityDestroyed(Activity activity) {
+                        if (isLoggingEnabled()) {
+                            String actName = activity.getClass().getSimpleName();
+                            Log.d(Countly.TAG, "[Countly] onActivityDestroyed, " + actName);
+                        }
+                        for (ModuleBase module:modules) {
+                            module.callbackOnActivityDestroyed(activity);
+                        }
+                    }
+                });
+/*
+                config.application.registerComponentCallbacks(new ComponentCallbacks() {
+                    @Override
+                    public void onConfigurationChanged(Configuration configuration) {
+
+                    }
+
+                    @Override
+                    public void onLowMemory() {
+
+                    }
+                });
+ */
             }
         } else {
             //if this is not the first time we are calling init
@@ -582,19 +744,18 @@ public class Countly {
 
             context_.sendBroadcast(new Intent(CONSENT_BROADCAST));
 
-            if (Countly.sharedInstance().isLoggingEnabled()) {
+            if (isLoggingEnabled()) {
                 Log.d(Countly.TAG, "[Init] Countly is initialized with the current consent state:");
                 checkAllConsent();
-            }
-
-            //update remote config_ values if automatic update is enabled
-            if(remoteConfigAutomaticUpdateEnabled && anyConsentGiven()){
-                RemoteConfig.updateRemoteConfigValues(context_, null, null, connectionQueue_, false, remoteConfigInitCallback);
             }
         }
 
         //check for previous native crash dumps
-        checkForNativeCrashDumps(config.context);
+        if(config.checkForNativeCrashDumps){
+            //flag so that this can be turned off during testing
+            moduleCrash.checkForNativeCrashDumps(config.context);
+        }
+
 
         return this;
     }
@@ -616,7 +777,7 @@ public class Countly {
      * again.
      */
     public synchronized void halt() {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.i(Countly.TAG, "Halting Countly!");
         }
         eventQueue_ = null;
@@ -628,8 +789,21 @@ public class Countly {
         connectionQueue_.setServerURL(null);
         connectionQueue_.setAppKey(null);
         connectionQueue_.setCountlyStore(null);
-        prevSessionDurationStartTime_ = 0;
         activityCount_ = 0;
+
+        for (ModuleBase module:modules) {
+            module.halt();
+        }
+        modules.clear();
+
+        moduleCrash = null;
+        moduleViews = null;
+        moduleEvents = null;
+        moduleRatings = null;
+        moduleSessions = null;
+        moduleRemoteConfig = null;
+        moduleConsent = null;
+        moduleAPM = null;
     }
 
     /**
@@ -640,23 +814,31 @@ public class Countly {
      * @throws IllegalStateException if Countly SDK has not been initialized
      */
     public synchronized void onStart(Activity activity) {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
-            Log.d(Countly.TAG, "Countly onStart called, [" + activityCount_ + "] -> [" + (activityCount_ + 1) + "] activities now open");
+        if (isLoggingEnabled()) {
+            String activityName = "NULL ACTIVITY PROVIDED";
+            if(activity != null){
+                activityName = activity.getClass().getSimpleName();
+            }
+            Log.d(Countly.TAG, "Countly onStart called, name:[" + activityName + "], [" + activityCount_ + "] -> [" + (activityCount_ + 1) + "] activities now open");
         }
 
         appLaunchDeepLink = false;
-        if (eventQueue_ == null) {
+        if (!isInitialized()) {
             throw new IllegalStateException("init must be called before onStart");
         }
 
         ++activityCount_;
-        if (activityCount_ == 1) {
-            onStartHelper();
+        if (activityCount_ == 1 && !moduleSessions.manualSessionControlEnabled) {
+            //if we open the first activity
+            //and we are not using manual session control,
+            //begin a session
+
+            moduleSessions.beginSessionInternal();
         }
 
         //check if there is an install referrer data
         String referrer = ReferrerReceiver.getReferrer(context_);
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Checking referrer: " + referrer);
         }
         if(referrer != null){
@@ -666,27 +848,11 @@ public class Countly {
 
         CrashDetails.inForeground();
 
-        if(autoViewTracker){
-            String usedActivityName;
-
-            if(automaticTrackingShouldUseShortName){
-                usedActivityName = activity.getClass().getSimpleName();
-            } else {
-                usedActivityName = activity.getClass().getName();
-            }
-            recordView(usedActivityName);
+        for (ModuleBase module:modules) {
+            module.onActivityStarted(activity);
         }
 
         calledAtLeastOnceOnStart = true;
-    }
-
-    /**
-     * Called when the first Activity is started. Sends a begin session event to the server
-     * and initializes application session tracking.
-     */
-    private void onStartHelper() {
-        prevSessionDurationStartTime_ = System.nanoTime();
-        connectionQueue_.beginSession();
     }
 
     /**
@@ -698,11 +864,11 @@ public class Countly {
      *                               unbalanced calls to onStart/onStop are detected
      */
     public synchronized void onStop() {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Countly onStop called, [" + activityCount_ + "] -> [" + (activityCount_ - 1) + "] activities now open");
         }
 
-        if (eventQueue_ == null) {
+        if (!isInitialized()) {
             throw new IllegalStateException("init must be called before onStop");
         }
         if (activityCount_ == 0) {
@@ -710,34 +876,31 @@ public class Countly {
         }
 
         --activityCount_;
-        if (activityCount_ == 0) {
-            onStopHelper();
+        if (activityCount_ == 0 && !moduleSessions.manualSessionControlEnabled) {
+            // if we don't use manual session control
+            // Called when final Activity is stopped.
+            // Sends an end session event to the server, also sends any unsent custom events.
+            moduleSessions.endSessionInternal(null);
         }
 
         CrashDetails.inBackground();
 
-        //report current view duration
-        reportViewDuration();
-    }
-
-    /**
-     * Called when final Activity is stopped. Sends an end session event to the server,
-     * also sends any unsent custom events.
-     */
-    private void onStopHelper() {
-        connectionQueue_.endSession(roundedSecondsSinceLastSessionDurationUpdate());
-        prevSessionDurationStartTime_ = 0;
-
-        if (eventQueue_.size() > 0) {
-            connectionQueue_.recordEvents(eventQueue_.events());
+        for (ModuleBase module:modules) {
+            module.onActivityStopped();
         }
     }
 
-    /**
-     * Called when GCM Registration ID is received. Sends a token session event to the server.
-     */
-    public void onRegistrationId(String registrationId) {
-        onRegistrationId(registrationId, messagingMode_);
+    public synchronized void onConfigurationChanged(Configuration newConfig){
+        if (isLoggingEnabled()) {
+            Log.d(Countly.TAG, "Calling [onConfigurationChanged]");
+        }
+        if (!isInitialized()) {
+            throw new IllegalStateException("init must be called before onConfigurationChanged");
+        }
+
+        for (ModuleBase module:modules) {
+            module.onConfigurationChanged(newConfig);
+        }
     }
 
     /**
@@ -758,10 +921,10 @@ public class Countly {
      * @param deviceId Optional device ID for a case when type = DEVELOPER_SPECIFIED
      */
     public void changeDeviceId(DeviceId.Type type, String deviceId) {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Calling [changeDeviceId] with type and ID");
         }
-        if (eventQueue_ == null) {
+        if (!isInitialized()) {
             throw new IllegalStateException("init must be called before changeDeviceId");
         }
         //if (activityCount_ == 0) {
@@ -772,7 +935,7 @@ public class Countly {
         }
 
         if(!anyConsentGiven()){
-            if (Countly.sharedInstance().isLoggingEnabled()) {
+            if (isLoggingEnabled()) {
                 Log.w(Countly.TAG, "Can't change Device ID if no consent is given");
             }
             return;
@@ -780,13 +943,13 @@ public class Countly {
 
         DeviceId currentDeviceId = connectionQueue_.getDeviceId();
 
-        if(currentDeviceId.temporaryIdModeEnabled() && deviceId.equals(DeviceId.temporaryCountlyDeviceId)){
+        if(currentDeviceId.temporaryIdModeEnabled() && (deviceId != null && deviceId.equals(DeviceId.temporaryCountlyDeviceId))){
             // we already are in temporary mode and we want to set temporary mode
             // in this case we just ignore the request since nothing has to be done
             return;
         }
 
-        if(currentDeviceId.temporaryIdModeEnabled()){
+        if(currentDeviceId.temporaryIdModeEnabled() || connectionQueue_.queueContainsTemporaryIdItems()){
             // we are about to exit temporary ID mode
             // because of the previous check, we know that the new type is a different one
             // we just call our method for exiting it
@@ -801,15 +964,18 @@ public class Countly {
         //force flush events so that they are associated correctly
         sendEventsForced();
 
-        connectionQueue_.endSession(roundedSecondsSinceLastSessionDurationUpdate(), currentDeviceId.getId());
+        moduleSessions.endSessionInternal(currentDeviceId.getId());
         currentDeviceId.changeToId(context_, connectionQueue_.getCountlyStore(), type, deviceId);
-        connectionQueue_.beginSession();
+        moduleSessions.beginSessionInternal();
 
         //update remote config_ values if automatic update is enabled
         remoteConfigClearValues();
         if (remoteConfigAutomaticUpdateEnabled && anyConsentGiven()) {
-            RemoteConfig.updateRemoteConfigValues(context_, null, null, connectionQueue_, false, null);
+            moduleRemoteConfig.updateRemoteConfigValues(null, null, connectionQueue_, false, null);
         }
+
+        //clear automated star rating session values because now we have a new user
+        moduleRatings.clearAutomaticStarRatingSessionCountInternal(connectionQueue_.getCountlyStore());
     }
 
     /**
@@ -818,7 +984,7 @@ public class Countly {
      * @param deviceId new device id
      */
     public void changeDeviceId(String deviceId) {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Calling [changeDeviceId] only with ID");
         }
         if (!isInitialized()) {
@@ -832,20 +998,21 @@ public class Countly {
         }
 
         if(!anyConsentGiven()){
-            if (Countly.sharedInstance().isLoggingEnabled()) {
+            if (isLoggingEnabled()) {
                 Log.w(Countly.TAG, "Can't change Device ID if no consent is given");
             }
             return;
         }
 
-        if(connectionQueue_.getDeviceId().temporaryIdModeEnabled()){
-            //if we are in temporary ID mode
+        if(connectionQueue_.getDeviceId().temporaryIdModeEnabled() || connectionQueue_.queueContainsTemporaryIdItems()){
+            //if we are in temporary ID mode or
+            //at some moment have enabled temporary mode
 
             if(deviceId.equals(DeviceId.temporaryCountlyDeviceId)){
                 //if we want to enter temporary ID mode
                 //just exit, nothing to do
 
-                if (Countly.sharedInstance().isLoggingEnabled()) {
+                if (isLoggingEnabled()) {
                     Log.w(Countly.TAG, "[changeDeviceId] About to enter temporary ID mode when already in it");
                 }
 
@@ -857,19 +1024,22 @@ public class Countly {
             exitTemporaryIdMode(DeviceId.Type.DEVELOPER_SUPPLIED, deviceId);
         } else {
             //we are not in temporary mode, nothing special happens
-            connectionQueue_.changeDeviceId(deviceId, roundedSecondsSinceLastSessionDurationUpdate());
+            // we are either making a simple ID change or entering temporary mode
+            // in both cases we act the same as the temporary ID requests will be updated with the final ID later
+
+            connectionQueue_.changeDeviceId(deviceId, moduleSessions.roundedSecondsSinceLastSessionDurationUpdate());
 
             //update remote config_ values if automatic update is enabled
             remoteConfigClearValues();
             if (remoteConfigAutomaticUpdateEnabled && anyConsentGiven()) {
                 //request should be delayed, because of the delayed server merge
-                RemoteConfig.updateRemoteConfigValues(context_, null, null, connectionQueue_, true, null);
+                moduleRemoteConfig.updateRemoteConfigValues(null, null, connectionQueue_, true, null);
             }
         }
     }
 
     private void exitTemporaryIdMode(DeviceId.Type type, String deviceId){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Calling exitTemporaryIdMode");
         }
 
@@ -881,12 +1051,29 @@ public class Countly {
         connectionQueue_.getDeviceId().changeToId(context_, connectionQueue_.getCountlyStore(), type, deviceId);
 
         //update stored request for ID change to use this new ID
+        String[] storedRequests = connectionQueue_.getCountlyStore().connections();
+        String temporaryIdTag = "&device_id=" + DeviceId.temporaryCountlyDeviceId;
+        String newIdTag = "&device_id=" + deviceId;
 
+        boolean foundOne = false;
+        for(int a = 0 ; a < storedRequests.length ; a++){
+            if(storedRequests[a].contains(temporaryIdTag)){
+                if (isLoggingEnabled()) {
+                    Log.d(Countly.TAG, "[exitTemporaryIdMode] Found a tag to replace in: [" + storedRequests[a] + "]");
+                }
+                storedRequests[a] = storedRequests[a].replace(temporaryIdTag, newIdTag);
+                foundOne = true;
+            }
+        }
+
+        if(foundOne){
+            connectionQueue_.getCountlyStore().replaceConnections(storedRequests);
+        }
 
         //update remote config_ values if automatic update is enabled
         remoteConfigClearValues();
         if (remoteConfigAutomaticUpdateEnabled && anyConsentGiven()) {
-            RemoteConfig.updateRemoteConfigValues(context_, null, null, connectionQueue_, false, null);
+            moduleRemoteConfig.updateRemoteConfigValues(null, null, connectionQueue_, false, null);
         }
 
         doStoredRequests();
@@ -897,6 +1084,7 @@ public class Countly {
      * @param key name of the custom event, required, must not be the empty string
      * @throws IllegalStateException if Countly SDK has not been initialized
      * @throws IllegalArgumentException if key is null or empty
+     * @deprecated record events through 'Countly.sharedInstance().events()'
      */
     public void recordEvent(final String key) {
         recordEvent(key, null, 1, 0);
@@ -908,6 +1096,7 @@ public class Countly {
      * @param count count to associate with the event, should be more than zero
      * @throws IllegalStateException if Countly SDK has not been initialized
      * @throws IllegalArgumentException if key is null or empty
+     * @deprecated record events through 'Countly.sharedInstance().events()'
      */
     public void recordEvent(final String key, final int count) {
         recordEvent(key, null, count, 0);
@@ -920,6 +1109,7 @@ public class Countly {
      * @param sum sum to associate with the event
      * @throws IllegalStateException if Countly SDK has not been initialized
      * @throws IllegalArgumentException if key is null or empty
+     * @deprecated record events through 'Countly.sharedInstance().events()'
      */
     public void recordEvent(final String key, final int count, final double sum) {
         recordEvent(key, null, count, sum);
@@ -932,6 +1122,7 @@ public class Countly {
      * @param count count to associate with the event, should be more than zero
      * @throws IllegalStateException if Countly SDK has not been initialized
      * @throws IllegalArgumentException if key is null or empty
+     * @deprecated record events through 'Countly.sharedInstance().events()'
      */
     public void recordEvent(final String key, final Map<String, String> segmentation, final int count) {
         recordEvent(key, segmentation, count, 0);
@@ -946,6 +1137,7 @@ public class Countly {
      * @throws IllegalStateException if Countly SDK has not been initialized
      * @throws IllegalArgumentException if key is null or empty, count is less than 1, or if
      *                                  segmentation contains null or empty keys or values
+     * @deprecated record events through 'Countly.sharedInstance().events()'
      */
     public synchronized void recordEvent(final String key, final Map<String, String> segmentation, final int count, final double sum) {
         recordEvent(key, segmentation, count, sum, 0);
@@ -961,9 +1153,10 @@ public class Countly {
      * @throws IllegalStateException if Countly SDK has not been initialized
      * @throws IllegalArgumentException if key is null or empty, count is less than 1, or if
      *                                  segmentation contains null or empty keys or values
+     * @deprecated record events through 'Countly.sharedInstance().events()'
      */
     public synchronized void recordEvent(final String key, final Map<String, String> segmentation, final int count, final double sum, final double dur){
-        recordEvent(key, segmentation, null, null, count, sum, 0);
+        recordEvent(key, segmentation, null, null, count, sum, dur);
     }
 
     /**
@@ -976,75 +1169,27 @@ public class Countly {
      * @throws IllegalStateException if Countly SDK has not been initialized
      * @throws IllegalArgumentException if key is null or empty, count is less than 1, or if
      *                                  segmentation contains null or empty keys or values
+     * @deprecated record events through 'Countly.sharedInstance().events()'
      */
     public synchronized void recordEvent(final String key, final Map<String, String> segmentation, final Map<String, Integer> segmentationInt, final Map<String, Double> segmentationDouble, final int count, final double sum, final double dur) {
         if (!isInitialized()) {
             throw new IllegalStateException("Countly.sharedInstance().init must be called before recordEvent");
         }
-        if (key == null || key.length() == 0) {
-            throw new IllegalArgumentException("Valid Countly event key is required");
-        }
-        if (count < 1) {
-            throw new IllegalArgumentException("Countly event count should be greater than zero");
+
+        Map<String, Object> segmentationGroup = new HashMap<>();
+        if(segmentation != null) {
+            segmentationGroup.putAll(segmentation);
         }
 
-        if (Countly.sharedInstance().isLoggingEnabled()) {
-            Log.d(Countly.TAG, "Recording event with key: [" + key + "]");
+        if(segmentationInt != null) {
+            segmentationGroup.putAll(segmentationInt);
         }
 
-        if (segmentation != null) {
-            for (String k : segmentation.keySet()) {
-                if (k == null || k.length() == 0) {
-                    throw new IllegalArgumentException("Countly event segmentation key cannot be null or empty");
-                }
-                if (segmentation.get(k) == null || segmentation.get(k).length() == 0) {
-                    throw new IllegalArgumentException("Countly event segmentation value cannot be null or empty");
-                }
-            }
+        if(segmentationDouble != null) {
+            segmentationGroup.putAll(segmentationDouble);
         }
 
-        if (segmentationInt != null) {
-            for (String k : segmentationInt.keySet()) {
-                if (k == null || k.length() == 0) {
-                    throw new IllegalArgumentException("Countly event segmentation key cannot be null or empty");
-                }
-                if (segmentationInt.get(k) == null) {
-                    throw new IllegalArgumentException("Countly event segmentation value cannot be null");
-                }
-            }
-        }
-
-        if (segmentationDouble != null) {
-            for (String k : segmentationDouble.keySet()) {
-                if (k == null || k.length() == 0) {
-                    throw new IllegalArgumentException("Countly event segmentation key cannot be null or empty");
-                }
-                if (segmentationDouble.get(k) == null) {
-                    throw new IllegalArgumentException("Countly event segmentation value cannot be null");
-                }
-            }
-        }
-
-        switch (key) {
-            case STAR_RATING_EVENT_KEY:
-                if (Countly.sharedInstance().getConsent(CountlyFeatureNames.starRating)) {
-                    eventQueue_.recordEvent(key, segmentation, segmentationInt, segmentationDouble, count, sum, dur);
-                    sendEventsForced();
-                }
-                break;
-            case VIEW_EVENT_KEY:
-                if (Countly.sharedInstance().getConsent(CountlyFeatureNames.views)) {
-                    eventQueue_.recordEvent(key, segmentation, segmentationInt, segmentationDouble, count, sum, dur);
-                    sendEventsForced();
-                }
-                break;
-            default:
-                if (Countly.sharedInstance().getConsent(CountlyFeatureNames.events)) {
-                    eventQueue_.recordEvent(key, segmentation, segmentationInt, segmentationDouble, count, sum, dur);
-                    sendEventsIfNeeded();
-                }
-                break;
-        }
+        events().recordEvent(key, segmentationGroup, count, sum, dur);
     }
 
     /**
@@ -1054,7 +1199,7 @@ public class Countly {
      * @return Returns link to Countly for call chaining
      */
     public synchronized Countly setViewTracking(boolean enable){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Enabling automatic view tracking");
         }
         autoViewTracker = enable;
@@ -1064,6 +1209,7 @@ public class Countly {
     /**
      * Check state of automatic view tracking
      * @return boolean - true if enabled, false if disabled
+     * @deprecated use 'Countly.sharedInstance().views().isAutomaticViewTrackingEnabled()'
      */
     public synchronized boolean isViewTrackingEnabled(){
         return autoViewTracker;
@@ -1075,129 +1221,31 @@ public class Countly {
      * like fragment, Message box or transparent Activity
      * @param viewName String - name of the view
      * @return Returns link to Countly for call chaining
+     * @deprecated use 'Countly.sharedInstance().views().recordView()'
      */
-    public synchronized Countly recordView(String viewName){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
-            Log.d(Countly.TAG, "Recording view with name: [" + viewName + "]");
+    public synchronized Countly recordView(String viewName) {
+        if (!isInitialized()) {
+            throw new IllegalStateException("Countly.sharedInstance().init must be called before recordView");
         }
 
-        reportViewDuration();
-        lastView = viewName;
-        lastViewStart = Countly.currentTimestamp();
-        HashMap<String, String> segments = new HashMap<>();
-        segments.put("name", viewName);
-        segments.put("visit", "1");
-        segments.put("segment", "Android");
-        if(firstView) {
-            firstView = false;
-            segments.put("start", "1");
-        }
-        recordEvent(VIEW_EVENT_KEY, segments, 1);
-        return this;
+        return recordView(viewName, null);
     }
 
     /**
-     * Sets information about user. Possible keys are:
-     * <ul>
-     * <li>
-     * name - (String) providing user's full name
-     * </li>
-     * <li>
-     * username - (String) providing user's nickname
-     * </li>
-     * <li>
-     * email - (String) providing user's email address
-     * </li>
-     * <li>
-     * organization - (String) providing user's organization's name where user works
-     * </li>
-     * <li>
-     * phone - (String) providing user's phone number
-     * </li>
-     * <li>
-     * picture - (String) providing WWW URL to user's avatar or profile picture
-     * </li>
-     * <li>
-     * picturePath - (String) providing local path to user's avatar or profile picture
-     * </li>
-     * <li>
-     * gender - (String) providing user's gender as M for male and F for female
-     * </li>
-     * <li>
-     * byear - (int) providing user's year of birth as integer
-     * </li>
-     * </ul>
-     * @param data Map&lt;String, String&gt; with user data
-     * @deprecated use {@link UserData#setUserData(Map)} to set data and {@link UserData#save()} to send it to server.
+     *  Record a view manually, without automatic tracking
+     * or track view that is not automatically tracked
+     * like fragment, Message box or transparent Activity
+     * @param viewName String - name of the view
+     * @param viewSegmentation Map<String, Object> - segmentation that will be added to the view, set 'null' if none should be added
+     * @return Returns link to Countly for call chaining
+     * @deprecated use 'Countly.sharedInstance().views().recordView()'
      */
-    public synchronized Countly setUserData(Map<String, String> data) {
-        return setUserData(data, null);
-    }
-
-    /**
-     * Sets information about user with custom properties.
-     * In custom properties you can provide any string key values to be stored with user
-     * Possible keys are:
-     * <ul>
-     * <li>
-     * name - (String) providing user's full name
-     * </li>
-     * <li>
-     * username - (String) providing user's nickname
-     * </li>
-     * <li>
-     * email - (String) providing user's email address
-     * </li>
-     * <li>
-     * organization - (String) providing user's organization's name where user works
-     * </li>
-     * <li>
-     * phone - (String) providing user's phone number
-     * </li>
-     * <li>
-     * picture - (String) providing WWW URL to user's avatar or profile picture
-     * </li>
-     * <li>
-     * picturePath - (String) providing local path to user's avatar or profile picture
-     * </li>
-     * <li>
-     * gender - (String) providing user's gender as M for male and F for female
-     * </li>
-     * <li>
-     * byear - (int) providing user's year of birth as integer
-     * </li>
-     * </ul>
-     * @param data Map&lt;String, String&gt; with user data
-     * @param customdata Map&lt;String, String&gt; with custom key values for this user
-     * @deprecated use {@link UserData#setUserData(Map, Map)} to set data and {@link UserData#save()}  to send it to server.
-     */
-    public synchronized Countly setUserData(Map<String, String> data, Map<String, String> customdata) {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
-            Log.d(Countly.TAG, "Setting user data");
+    public synchronized Countly recordView(String viewName, Map<String, Object> viewSegmentation) {
+        if (!isInitialized()) {
+            throw new IllegalStateException("Countly.sharedInstance().init must be called before recordView");
         }
-        UserData.setData(data);
-        if(customdata != null)
-            UserData.setCustomData(customdata);
-        connectionQueue_.sendUserData();
-        UserData.clear();
-        return this;
-    }
 
-    /**
-     * Sets custom properties.
-     * In custom properties you can provide any string key values to be stored with user
-     * @param customdata Map&lt;String, String&gt; with custom key values for this user
-     * @deprecated use {@link UserData#setCustomUserData(Map)} to set data and {@link UserData#save()} to send it to server.
-     */
-    public synchronized Countly setCustomUserData(Map<String, String> customdata) {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
-            Log.d(Countly.TAG, "Setting custom user data");
-        }
-        if(customdata != null)
-            UserData.setCustomData(customdata);
-        connectionQueue_.sendUserData();
-        UserData.clear();
-        return this;
+        return moduleViews.recordViewInternal(viewName, viewSegmentation);
     }
 
     /**
@@ -1205,7 +1253,7 @@ public class Countly {
      * @return Returns link to Countly for call chaining
      */
     public synchronized Countly disableLocation() {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Disabling location");
         }
 
@@ -1238,7 +1286,7 @@ public class Countly {
      * @return Returns link to Countly for call chaining
      */
     public synchronized Countly setLocation(String country_code, String city, String location, String ipAddress){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Setting location parameters");
         }
 
@@ -1263,7 +1311,7 @@ public class Countly {
         }
 
         if((country_code == null && city != null) || (city == null && country_code != null)) {
-            if (Countly.sharedInstance().isLoggingEnabled()) {
+            if (isLoggingEnabled()) {
                 Log.w(Countly.TAG, "In \"setLocation\" both city and country code need to be set at the same time to be sent");
             }
         }
@@ -1274,7 +1322,7 @@ public class Countly {
 
 
         if(isBeginSessionSent || !Countly.sharedInstance().getConsent(Countly.CountlyFeatureNames.sessions)){
-            //send as a seperate request if either begin session was already send and we missed our first opportunity
+            //send as a separate request if either begin session was already send and we missed our first opportunity
             //or if consent for sessions is not given and our only option to send this is as a separate request
             connectionQueue_.sendLocation();
         } else {
@@ -1289,181 +1337,95 @@ public class Countly {
      * In custom segments you can provide any string key values to segments crashes by
      * @param segments Map&lt;String, String&gt; key segments and their values
      * @return Returns link to Countly for call chaining
+     * @deprecated set this through CountlyConfig during init
      */
     public synchronized Countly setCustomCrashSegments(Map<String, String> segments) {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
-            Log.d(Countly.TAG, "Setting custom crash segments");
+        if (isLoggingEnabled()) {
+            Log.d(Countly.TAG, "Calling setCustomCrashSegments");
         }
 
-        if(!getConsent(CountlyFeatureNames.crashes)){
+        if(segments == null) {
             return this;
+        }
+
+        Map<String, Object> segm = new HashMap<>();
+        segm.putAll(segments);
+
+        setCustomCrashSegmentsInternal(segm);
+
+        return this;
+    }
+
+    /**
+     * Sets custom segments to be reported with crash reports
+     * In custom segments you can provide any string key values to segments crashes by
+     * @param segments Map&lt;String, Object&gt; key segments and their values
+     * todo move to module after 'setCustomCrashSegments' is removed
+     */
+    synchronized void setCustomCrashSegmentsInternal(Map<String, Object> segments) {
+        if (isLoggingEnabled()) {
+            Log.d(Countly.TAG, "[ModuleCrash] Calling setCustomCrashSegmentsInternal");
+        }
+
+        if(!getConsent(Countly.CountlyFeatureNames.crashes)){
+            return;
         }
 
         if(segments != null) {
+            Utils.removeKeysFromMap(segments, ModuleEvents.reservedSegmentationKeys);
+            Utils.removeUnsupportedDataTypes(segments);
             CrashDetails.setCustomSegments(segments);
         }
-        return this;
     }
 
     /**
      * Add crash breadcrumb like log record to the log that will be send together with crash report
      * @param record String a bread crumb for the crash report
      * @return Returns link to Countly for call chaining
-     * @deprecated use `addCrashBreadcrumb`
-     */
-    public synchronized Countly addCrashLog(String record) {
-        return addCrashBreadcrumb(record);
-    }
-
-    /**
-     * Add crash breadcrumb like log record to the log that will be send together with crash report
-     * @param record String a bread crumb for the crash report
-     * @return Returns link to Countly for call chaining
+     * @deprecated use crashes().addCrashBreadcrumb
      */
     public synchronized Countly addCrashBreadcrumb(String record) {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
-            Log.d(Countly.TAG, "Adding crash breadcrumb");
-        }
-
-        if(!getConsent(CountlyFeatureNames.crashes)){
-            return this;
-        }
-
-        if(record == null || record.isEmpty()) {
-            if (Countly.sharedInstance().isLoggingEnabled()) {
-                Log.d(Countly.TAG, "Can't add a null or empty crash breadcrumb");
-            }
-            return this;
-        }
-
-        CrashDetails.addLog(record);
-        return this;
-    }
-
-    /**
-     * Called during init to check if there are any crash dumps saved
-     * @param context android context
-     */
-    protected synchronized void checkForNativeCrashDumps(Context context){
-        Log.d(TAG, "Checking for native crash dumps");
-
-        String basePath = context.getCacheDir().getAbsolutePath();
-        String finalPath = basePath + File.separator + countlyFolderName + File.separator + countlyNativeCrashFolderName;
-
-        File folder = new File(finalPath);
-        if (folder.exists()) {
-            Log.d(TAG, "Native crash folder exists, checking for dumps");
-
-            File[] dumpFiles = folder.listFiles();
-            Log.d(TAG,"Crash dump folder contains [" + dumpFiles.length + "] files");
-            for (int i = 0; i < dumpFiles.length; i++)
-            {
-                //record crash
-                recordNativeException(dumpFiles[i]);
-
-                //delete dump file
-                dumpFiles[i].delete();
-            }
-        } else {
-            Log.d(TAG, "Native crash folder does not exist");
-        }
-    }
-
-    protected synchronized void recordNativeException(File dumpFile){
-        Log.d(TAG, "Recording native crash dump: [" + dumpFile.getName() + "]");
-
-        //check for consent
-        if(!getConsent(CountlyFeatureNames.crashes)){
-            return;
-        }
-
-        //read bytes
-        int size = (int)dumpFile.length();
-        byte[] bytes = new byte[size];
-
-        try {
-            BufferedInputStream buf = new BufferedInputStream(new FileInputStream(dumpFile));
-            buf.read(bytes, 0, bytes.length);
-            buf.close();
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to read dump file bytes");
-            e.printStackTrace();
-            return;
-        }
-
-        //convert to base64
-        String dumpString = Base64.encodeToString(bytes, Base64.NO_WRAP);
-
-        //record crash
-        connectionQueue_.sendCrashReport(dumpString, false, true);
-    }
-
-    /**
-     * Log handled exception to report it to server as non fatal crash
-     * @param exception Exception to log
-     * @deprecated Use recordHandledException
-     * @return Returns link to Countly for call chaining
-     */
-    public synchronized Countly logException(Exception exception) {
-        return recordException(exception, true);
+        return crashes().addCrashBreadcrumb(record);
     }
 
     /**
      * Log handled exception to report it to server as non fatal crash
      * @param exception Exception to log
      * @return Returns link to Countly for call chaining
+     * @deprecated use crashes().recordHandledException
      */
     public synchronized Countly recordHandledException(Exception exception) {
-        return recordException(exception, true);
+        return moduleCrash.recordExceptionInternal(exception, true);
     }
 
     /**
      * Log handled exception to report it to server as non fatal crash
      * @param exception Throwable to log
      * @return Returns link to Countly for call chaining
+     * @deprecated use crashes().recordHandledException
      */
     public synchronized Countly recordHandledException(Throwable exception) {
-        return recordException(exception, true);
+        return moduleCrash.recordExceptionInternal(exception, true);
     }
 
     /**
      * Log unhandled exception to report it to server as fatal crash
      * @param exception Exception to log
      * @return Returns link to Countly for call chaining
+     * @deprecated use crashes().recordUnhandledException
      */
     public synchronized Countly recordUnhandledException(Exception exception) {
-        return recordException(exception, false);
+        return moduleCrash.recordExceptionInternal(exception, false);
     }
 
     /**
      * Log unhandled exception to report it to server as fatal crash
      * @param exception Throwable to log
      * @return Returns link to Countly for call chaining
+     * @deprecated use crashes().recordUnhandledException
      */
     public synchronized Countly recordUnhandledException(Throwable exception) {
-        return recordException(exception, false);
-    }
-
-    /**
-     * Common call for handling exceptions
-     * @param exception Exception to log
-     * @param itIsHandled If the exception is handled or not (fatal)
-     * @return Returns link to Countly for call chaining
-     */
-    private synchronized Countly recordException(Throwable exception, boolean itIsHandled) {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
-            Log.d(Countly.TAG, "Logging exception, handled:[" + itIsHandled + "]");
-        }
-
-        if(!getConsent(CountlyFeatureNames.crashes)){
-            return this;
-        }
-
-        StringWriter sw = new StringWriter();
-        PrintWriter pw = new PrintWriter(sw);
-        exception.printStackTrace(pw);
-        connectionQueue_.sendCrashReport(sw.toString(), itIsHandled, false);
-        return this;
+        return moduleCrash.recordExceptionInternal(exception, false);
     }
 
     /**
@@ -1472,7 +1434,7 @@ public class Countly {
      * @return Returns link to Countly for call chaining
      */
     public synchronized Countly enableCrashReporting() {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Enabling unhandled crash reporting");
         }
         //get default handler
@@ -1482,12 +1444,26 @@ public class Countly {
 
             @Override
             public void uncaughtException(Thread t, Throwable e) {
+                if (isLoggingEnabled()) {
+                    Log.d(Countly.TAG, "Uncaught crash handler triggered");
+                }
                 if(getConsent(CountlyFeatureNames.crashes)){
+
                     StringWriter sw = new StringWriter();
                     PrintWriter pw = new PrintWriter(sw);
                     e.printStackTrace(pw);
 
-                    Countly.sharedInstance().connectionQueue_.sendCrashReport(sw.toString(), false, false);
+                    //add other threads
+                    if(moduleCrash.recordAllThreads) {
+                        moduleCrash.addAllThreadInformationToCrash(pw);
+                    }
+
+                    String exceptionString = sw.toString();
+
+                    //check if it passes the crash filter
+                    if(!moduleCrash.crashFilterCheck(exceptionString)) {
+                        Countly.sharedInstance().connectionQueue_.sendCrashReport(exceptionString, false, false);
+                    }
                 }
 
                 //if there was another handler before
@@ -1506,28 +1482,21 @@ public class Countly {
      * Start timed event with a specified key
      * @param key name of the custom event, required, must not be the empty string or null
      * @return true if no event with this key existed before and event is started, false otherwise
+     * @deprecated use events().startEvent
      */
     public synchronized boolean startEvent(final String key) {
         if (!isInitialized()) {
             throw new IllegalStateException("Countly.sharedInstance().init must be called before recordEvent");
         }
-        if (key == null || key.length() == 0) {
-            throw new IllegalArgumentException("Valid Countly event key is required");
-        }
-        if (timedEvents.containsKey(key)) {
-            return false;
-        }
-        if (Countly.sharedInstance().isLoggingEnabled()) {
-            Log.d(Countly.TAG, "Starting event: [" + key + "]");
-        }
-        timedEvents.put(key, new Event(key));
-        return true;
+
+        return events().startEvent(key);
     }
 
     /**
      * End timed event with a specified key
      * @param key name of the custom event, required, must not be the empty string or null
      * @return true if event with this key has been previously started, false otherwise
+     * @deprecated use events().endEvent
      */
     public synchronized boolean endEvent(final String key) {
         return endEvent(key, null, 1, 0);
@@ -1543,6 +1512,7 @@ public class Countly {
      * @throws IllegalArgumentException if key is null or empty, count is less than 1, or if
      *                                  segmentation contains null or empty keys or values
      * @return true if event with this key has been previously started, false otherwise
+     * @deprecated use events().endEvent
      */
     public synchronized boolean endEvent(final String key, final Map<String, String> segmentation, final int count, final double sum) {
         return endEvent(key, segmentation, null, null, count, sum);
@@ -1557,76 +1527,27 @@ public class Countly {
      * @throws IllegalArgumentException if key is null or empty, count is less than 1, or if
      *                                  segmentation contains null or empty keys or values
      * @return true if event with this key has been previously started, false otherwise
+     * @deprecated use events().endEvent
      */
     public synchronized boolean endEvent(final String key, final Map<String, String> segmentation, final Map<String, Integer> segmentationInt, final Map<String, Double> segmentationDouble, final int count, final double sum) {
-        Event event = timedEvents.remove(key);
-
-        if (event != null) {
-            if(!getConsent(CountlyFeatureNames.events)) {
-                return true;
-            }
-
-            if (!isInitialized()) {
-                throw new IllegalStateException("Countly.sharedInstance().init must be called before recordEvent");
-            }
-            if (key == null || key.length() == 0) {
-                throw new IllegalArgumentException("Valid Countly event key is required");
-            }
-            if (count < 1) {
-                throw new IllegalArgumentException("Countly event count should be greater than zero");
-            }
-            if (Countly.sharedInstance().isLoggingEnabled()) {
-                Log.d(Countly.TAG, "Ending event: [" + key + "]");
-            }
-
-            if (segmentation != null) {
-                for (String k : segmentation.keySet()) {
-                    if (k == null || k.length() == 0) {
-                        throw new IllegalArgumentException("Countly event segmentation key cannot be null or empty");
-                    }
-                    if (segmentation.get(k) == null || segmentation.get(k).length() == 0) {
-                        throw new IllegalArgumentException("Countly event segmentation value cannot be null or empty");
-                    }
-                }
-            }
-
-            if (segmentationInt != null) {
-                for (String k : segmentationInt.keySet()) {
-                    if (k == null || k.length() == 0) {
-                        throw new IllegalArgumentException("Countly event segmentation key cannot be null or empty");
-                    }
-                    if (segmentationInt.get(k) == null) {
-                        throw new IllegalArgumentException("Countly event segmentation value cannot be null");
-                    }
-                }
-            }
-
-            if (segmentationDouble != null) {
-                for (String k : segmentationDouble.keySet()) {
-                    if (k == null || k.length() == 0) {
-                        throw new IllegalArgumentException("Countly event segmentation key cannot be null or empty");
-                    }
-                    if (segmentationDouble.get(k) == null) {
-                        throw new IllegalArgumentException("Countly event segmentation value cannot be null");
-                    }
-                }
-            }
-
-            long currentTimestamp = Countly.currentTimestampMs();
-
-            event.segmentation = segmentation;
-            event.segmentationDouble = segmentationDouble;
-            event.segmentationInt = segmentationInt;
-            event.dur = (currentTimestamp - event.timestamp) / 1000.0;
-            event.count = count;
-            event.sum = sum;
-
-            eventQueue_.recordEvent(event);
-            sendEventsIfNeeded();
-            return true;
-        } else {
-            return false;
+        if (!isInitialized()) {
+            throw new IllegalStateException("Countly.sharedInstance().init must be called before recordEvent");
         }
+
+        Map<String, Object> segmentationGroup = new HashMap<>();
+        if(segmentation != null) {
+            segmentationGroup.putAll(segmentation);
+        }
+
+        if(segmentationInt != null) {
+            segmentationGroup.putAll(segmentationInt);
+        }
+
+        if(segmentationDouble != null) {
+            segmentationGroup.putAll(segmentationDouble);
+        }
+
+        return events().endEvent(key, segmentationGroup, count, sum);
     }
 
     /**
@@ -1636,9 +1557,10 @@ public class Countly {
      * Note that event updates will still be sent every 10 events or 30 seconds after event recording.
      * @param disable whether or not to disable session time updates
      * @return Countly instance for easy method chaining
+     * @deprecated set through countlyConfig
      */
     public synchronized Countly setDisableUpdateSessionRequests(final boolean disable) {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Disabling periodic session time updates");
         }
         disableUpdateSessionRequests_ = disable;
@@ -1652,23 +1574,43 @@ public class Countly {
      * @return Countly instance for easy method chaining
      */
     public synchronized Countly setLoggingEnabled(final boolean enableLogging) {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Enabling logging");
         }
         enableLogging_ = enableLogging;
         return this;
     }
 
+    /**
+     * Check if logging has been enabled internally in the SDK
+     * @return true means "yes"
+     */
     public synchronized boolean isLoggingEnabled() {
         return enableLogging_;
     }
 
+    /**
+     *
+     * @param salt
+     * @deprecated use CountlyConfig (setParameterTamperingProtectionSalt) during init to set this
+     * @return
+     */
     public synchronized Countly enableParameterTamperingProtection(String salt) {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Enabling tamper protection");
         }
-        ConnectionProcessor.salt = salt;
+
+        enableParameterTamperingProtectionInternal(salt);
+
         return this;
+    }
+
+    /**
+     * Use by both the external call and config call
+     * @param salt
+     */
+    private synchronized void enableParameterTamperingProtectionInternal(String salt){
+        ConnectionProcessor.salt = salt;
     }
 
     /**
@@ -1679,21 +1621,39 @@ public class Countly {
         return calledAtLeastOnceOnStart;
     }
 
+    /**
+     *
+     * @param size
+     * @return
+     * @deprecated use countly config to set this
+     */
     public synchronized Countly setEventQueueSizeToSend(int size) {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Setting event queue size: [" + size + "]");
         }
+
+        if(size < 1){
+            if (isLoggingEnabled()) {
+                Log.d(Countly.TAG, "[setEventQueueSizeToSend] queue size can't be less than zero");
+            }
+            size = 1;
+        }
+
         EVENT_QUEUE_SIZE_THRESHOLD = size;
         return this;
     }
-
-    private boolean appLaunchDeepLink = true;
 
     public static void onCreate(Activity activity) {
         Intent launchIntent = activity.getPackageManager().getLaunchIntentForPackage(activity.getPackageName());
 
         if (sharedInstance().isLoggingEnabled()) {
-            Log.d(Countly.TAG, "Activity created: " + activity.getClass().getName() + " ( main is " + launchIntent.getComponent().getClassName() + ")");
+
+            String mainClassName = "[VALUE NULL]";
+            if(launchIntent != null && launchIntent.getComponent() != null){
+                mainClassName = launchIntent.getComponent().getClassName();
+            }
+
+            Log.d(Countly.TAG, "Activity created: " + activity.getClass().getName() + " ( main is " + mainClassName + ")");
         }
 
         Intent intent = activity.getIntent();
@@ -1711,34 +1671,11 @@ public class Countly {
     }
 
     /**
-     * Reports duration of last view
+     * Send events if any of them are stored
      */
-    private void reportViewDuration(){
-        if (sharedInstance().isLoggingEnabled()) {
-            Log.d(Countly.TAG, "View [" + lastView + "] is getting closed, reporting duration: [" + (Countly.currentTimestamp() - lastViewStart) + "], current timestamp: [" + Countly.currentTimestamp() + "], last views start: [" + lastViewStart + "]");
-        }
-
-        if(lastView != null && lastViewStart <= 0) {
-            if (Countly.sharedInstance().isLoggingEnabled()) {
-                Log.e(Countly.TAG, "Last view start value is not normal: [" + lastViewStart + "]");
-            }
-        }
-
-        if(!getConsent(CountlyFeatureNames.views)) {
-            return;
-        }
-
-        //only record view if the view name is not null and if it has a reasonable duration
-        //if the lastViewStart is equal to 0, the duration would be set to the current timestamp
-        //and therefore will be ignored
-        if(lastView != null && lastViewStart > 0){
-            HashMap<String, String> segments = new HashMap<>();
-            segments.put("name", lastView);
-            segments.put("dur", String.valueOf(Countly.currentTimestamp()-lastViewStart));
-            segments.put("segment", "Android");
-            recordEvent(VIEW_EVENT_KEY,segments,1);
-            lastView = null;
-            lastViewStart = 0;
+    protected void sendEventsIfExist() {
+        if (eventQueue_.size() > 0) {
+            connectionQueue_.recordEvents(eventQueue_.events());
         }
     }
 
@@ -1763,119 +1700,24 @@ public class Countly {
      * is not an active application session.
      */
     synchronized void onTimer() {
-        final boolean hasActiveSession = activityCount_ > 0;
-        if (hasActiveSession) {
-            if (!disableUpdateSessionRequests_) {
-                connectionQueue_.updateSession(roundedSecondsSinceLastSessionDurationUpdate());
-            }
-            if (eventQueue_.size() > 0) {
-                connectionQueue_.recordEvents(eventQueue_.events());
-            }
+        if (isLoggingEnabled()) {
+            Log.v(Countly.TAG, "[onTimer] Calling heartbeat, Activity count:[" + activityCount_ + "]");
         }
 
-        if(isInitialized()){
-            connectionQueue_.tick();
-        }
-    }
+        if (isInitialized()) {
+            final boolean hasActiveSession = activityCount_ > 0;
+            if (hasActiveSession) {
+                if(!moduleSessions.manualSessionControlEnabled) {
+                    moduleSessions.updateSessionInternal();
+                }
 
-    /**
-     * Calculates the unsent session duration in seconds, rounded to the nearest int.
-     */
-    int roundedSecondsSinceLastSessionDurationUpdate() {
-        final long currentTimestampInNanoseconds = System.nanoTime();
-        final long unsentSessionLengthInNanoseconds = currentTimestampInNanoseconds - prevSessionDurationStartTime_;
-        prevSessionDurationStartTime_ = currentTimestampInNanoseconds;
-        return (int) Math.round(unsentSessionLengthInNanoseconds / 1000000000.0d);
-    }
-
-    /**
-     * Utility method to return a current timestamp that can be used in the Count.ly API.
-     */
-    static int currentTimestamp() {
-        return ((int)(System.currentTimeMillis() / 1000L));
-    }
-
-    static class TimeUniquesEnsurer {
-        final List<Long> lastTsMs = new ArrayList<>(10);
-        final long addition = 0;
-
-        long currentTimeMillis() {
-            return System.currentTimeMillis() + addition;
-        }
-
-        synchronized long uniqueTimestamp() {
-            long ms = currentTimeMillis();
-
-            // change time back case
-            if (lastTsMs.size() > 2) {
-                long min = Collections.min(lastTsMs);
-                if (ms < min) {
-                    lastTsMs.clear();
-                    lastTsMs.add(ms);
-                    return ms;
+                if (eventQueue_.size() > 0) {
+                    connectionQueue_.recordEvents(eventQueue_.events());
                 }
             }
-            // usual case
-            while (lastTsMs.contains(ms)) {
-                ms += 1;
-            }
-            while (lastTsMs.size() >= 10) {
-                lastTsMs.remove(0);
-            }
-            lastTsMs.add(ms);
-            return ms;
+
+            connectionQueue_.tick();
         }
-    }
-    private static final TimeUniquesEnsurer timeGenerator = new TimeUniquesEnsurer();
-
-    static synchronized long currentTimestampMs() {
-        return timeGenerator.uniqueTimestamp();
-    }
-
-    /**
-     * Utility method to return a current hour of the day that can be used in the Count.ly API.
-     */
-    static int currentHour(){return Calendar.getInstance().get(Calendar.HOUR_OF_DAY); }
-
-    /**
-     * Utility method to return a current day of the week that can be used in the Count.ly API.
-     */
-    @SuppressLint("SwitchIntDef")
-    static int currentDayOfWeek(){
-        int day = Calendar.getInstance().get(Calendar.DAY_OF_WEEK);
-        switch (day) {
-            case Calendar.MONDAY:
-                return 1;
-            case Calendar.TUESDAY:
-                return 2;
-            case Calendar.WEDNESDAY:
-                return 3;
-            case Calendar.THURSDAY:
-                return 4;
-            case Calendar.FRIDAY:
-                return 5;
-            case Calendar.SATURDAY:
-                return 6;
-        }
-        return 0;
-    }
-
-    /**
-     * Utility method for testing validity of a URL.
-     */
-    @SuppressWarnings("ConstantConditions")
-    static boolean isValidURL(final String urlStr) {
-        boolean validURL = false;
-        if (urlStr != null && urlStr.length() > 0) {
-            try {
-                new URL(urlStr);
-                validURL = true;
-            }
-            catch (MalformedURLException e) {
-                validURL = false;
-            }
-        }
-        return validURL;
     }
 
     /**
@@ -1885,6 +1727,7 @@ public class Countly {
      * if public key of SSL certificate provided by the server matches one provided to this method or by {@link #enableCertificatePinning(List)}.
      * @param certificates List of SSL public keys
      * @return Countly instance
+     * @deprecated set this through CountlyConfig
      */
     public static Countly enablePublicKeyPinning(List<String> certificates) {
         if (Countly.sharedInstance().isLoggingEnabled()) {
@@ -1901,6 +1744,7 @@ public class Countly {
      * if certificate provided by the server matches one provided to this method or by {@link #enablePublicKeyPinning(List)}.
      * @param certificates List of SSL certificates
      * @return Countly instance
+     * @deprecated set this through CountlyConfig
      */
     public static Countly enableCertificatePinning(List<String> certificates) {
         if (Countly.sharedInstance().isLoggingEnabled()) {
@@ -1914,17 +1758,33 @@ public class Countly {
      * Shows the star rating dialog
      * @param activity the activity that will own the dialog
      * @param callback callback for the star rating dialog "rate" and "dismiss" events
+     * @deprecated call this trough 'Countly.sharedInstance().remoteConfig()'
      */
-    public void showStarRating(Activity activity, CountlyStarRating.RatingCallback callback){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
-            Log.d(Countly.TAG, "Showing star rating");
+    public void showStarRating(Activity activity, final CountlyStarRating.RatingCallback callback){
+        if(!isInitialized()) {
+            if (isLoggingEnabled()) {
+                Log.e(Countly.TAG, "Can't call this function before init has been called");
+                return;
+            }
         }
 
-        if(!getConsent(CountlyFeatureNames.starRating)) {
-            return;
+        if(callback == null) {
+            ratings().showStarRating(activity, null);
+        } else {
+            ratings().showStarRating(activity, new StarRatingCallback() {
+                @Override
+                public void onRate(int rating) {
+                    callback.onRate(rating);
+                }
+
+                @Override
+                public void onDismiss() {
+                    callback.onDismiss();
+                }
+            });
         }
 
-        CountlyStarRating.showStarRating(activity, callback);
+
     }
 
     /**
@@ -1932,20 +1792,21 @@ public class Countly {
      * @param starRatingTextTitle dialog's title text
      * @param starRatingTextMessage dialog's message text
      * @param starRatingTextDismiss dialog's dismiss buttons text
+     * @deprecated use CountlyConfig during init to set this
      */
     public synchronized Countly setStarRatingDialogTexts(String starRatingTextTitle, String starRatingTextMessage, String starRatingTextDismiss) {
-        if(context_ == null) {
-            if (Countly.sharedInstance().isLoggingEnabled()) {
+        if(!isInitialized()) {
+            if (isLoggingEnabled()) {
                 Log.e(Countly.TAG, "Can't call this function before init has been called");
                 return this;
             }
         }
 
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Setting star rating texts");
         }
 
-        CountlyStarRating.setStarRatingInitConfig(context_, -1, starRatingTextTitle, starRatingTextMessage, starRatingTextDismiss);
+        moduleRatings.setStarRatingInitConfig(connectionQueue_.getCountlyStore(), -1, starRatingTextTitle, starRatingTextMessage, starRatingTextDismiss);
 
         return this;
     }
@@ -1953,20 +1814,21 @@ public class Countly {
     /**
      * Set if the star rating should be shown automatically
      * @param IsShownAutomatically set it true if you want to show the app star rating dialog automatically for each new version after the specified session amount
+     * @deprecated use CountlyConfig during init to set this
      */
     public synchronized Countly setIfStarRatingShownAutomatically(boolean IsShownAutomatically) {
-        if(context_ == null) {
-            if (Countly.sharedInstance().isLoggingEnabled()) {
+        if(!isInitialized()) {
+            if (isLoggingEnabled()) {
                 Log.e(Countly.TAG, "Can't call this function before init has been called");
                 return this;
             }
         }
 
-        if (Countly.sharedInstance().isLoggingEnabled()) {
-            Log.d(Countly.TAG, "Setting to show star rating automaticaly: [" + IsShownAutomatically + "]");
+        if (isLoggingEnabled()) {
+            Log.d(Countly.TAG, "Setting to show star rating automatically: [" + IsShownAutomatically + "]");
         }
 
-        CountlyStarRating.setShowDialogAutomatically(context_, IsShownAutomatically);
+        moduleRatings.setShowDialogAutomatically(connectionQueue_.getCountlyStore(), IsShownAutomatically);
 
         return this;
     }
@@ -1974,20 +1836,21 @@ public class Countly {
     /**
      * Set if the star rating is shown only once per app lifetime
      * @param disableAsking set true if you want to disable asking the app rating for each new app version (show it only once per apps lifetime)
+     * @deprecated use CountlyConfig during init to set this
      */
     public synchronized Countly setStarRatingDisableAskingForEachAppVersion(boolean disableAsking) {
-        if(context_ == null) {
-            if (Countly.sharedInstance().isLoggingEnabled()) {
+        if(!isInitialized()) {
+            if (isLoggingEnabled()) {
                 Log.e(Countly.TAG, "Can't call this function before init has been called");
                 return this;
             }
         }
 
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Setting to disable showing of star rating for each app version:[" + disableAsking + "]");
         }
 
-        CountlyStarRating.setStarRatingDisableAskingForEachAppVersion(context_, disableAsking);
+        moduleRatings.setStarRatingDisableAskingForEachAppVersion(connectionQueue_.getCountlyStore(), disableAsking);
 
         return this;
     }
@@ -1996,37 +1859,39 @@ public class Countly {
      * Set after how many sessions the automatic star rating will be shown for each app version
      * @param limit app session amount for the limit
      * @return Returns link to Countly for call chaining
+     * @deprecated use CountlyConfig during init to set this
      */
     public synchronized Countly setAutomaticStarRatingSessionLimit(int limit) {
-        if(context_ == null) {
-            if (Countly.sharedInstance().isLoggingEnabled()) {
+        if(!isInitialized()) {
+            if (isLoggingEnabled()) {
                 Log.e(Countly.TAG, "Can't call this function before init has been called");
                 return this;
             }
         }
 
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Setting automatic star rating session limit: [" + limit + "]");
         }
-        CountlyStarRating.setStarRatingInitConfig(context_, limit, null, null, null);
+        moduleRatings.setStarRatingInitConfig(connectionQueue_.getCountlyStore(), limit, null, null, null);
 
         return this;
     }
 
     /**
      * Returns the session limit set for automatic star rating
+     * @deprecated use 'Countly.sharedInstance().ratings().getAutomaticStarRatingSessionLimit()'
      */
     public int getAutomaticStarRatingSessionLimit(){
-        if(context_ == null) {
-            if (Countly.sharedInstance().isLoggingEnabled()) {
+        if(!isInitialized()) {
+            if (isLoggingEnabled()) {
                 Log.e(Countly.TAG, "Can't call this function before init has been called");
                 return -1;
             }
         }
 
-        int sessionLimit = CountlyStarRating.getAutomaticStarRatingSessionLimit(context_);
+        int sessionLimit = ModuleRatings.getAutomaticStarRatingSessionLimitInternal(connectionQueue_.getCountlyStore());
 
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Getting automatic star rating session limit: [" + sessionLimit + "]");
         }
 
@@ -2035,59 +1900,52 @@ public class Countly {
 
     /**
      * Returns how many sessions has star rating counted internally for the current apps version
+     * @deprecated use 'Countly.sharedInstance().ratings().getCurrentVersionsSessionCount()'
      */
     public int getStarRatingsCurrentVersionsSessionCount(){
-        if(context_ == null) {
-            if (Countly.sharedInstance().isLoggingEnabled()) {
+        if(!isInitialized()) {
+            if (isLoggingEnabled()) {
                 Log.e(Countly.TAG, "Can't call this function before init has been called");
                 return -1;
             }
         }
 
-        int sessionCount = CountlyStarRating.getCurrentVersionsSessionCount(context_);
-
-        if (Countly.sharedInstance().isLoggingEnabled()) {
-            Log.d(Countly.TAG, "Getting star rating current version session count: [" + sessionCount + "]");
-        }
-
-        return sessionCount;
+        return ratings().getCurrentVersionsSessionCount();
     }
 
     /**
      * Set the automatic star rating session count back to 0
+     * @deprecated use 'Countly.sharedInstance().ratings().getCurrentVersionsSessionCount()' to get achieve this
      */
     public void clearAutomaticStarRatingSessionCount(){
-        if(context_ == null) {
-            if (Countly.sharedInstance().isLoggingEnabled()) {
+        if(!isInitialized()) {
+            if (isLoggingEnabled()) {
                 Log.e(Countly.TAG, "Can't call this function before init has been called");
                 return;
             }
         }
 
-        if (Countly.sharedInstance().isLoggingEnabled()) {
-            Log.d(Countly.TAG, "Clearing star rating session count");
-        }
-
-        CountlyStarRating.clearAutomaticStarRatingSessionCount(context_);
+        ratings().clearAutomaticStarRatingSessionCount();
     }
 
     /**
      * Set if the star rating dialog is cancellable
      * @param isCancellable set this true if it should be cancellable
+     * @deprecated use CountlyConfig during init to set this
      */
     public synchronized Countly setIfStarRatingDialogIsCancellable(boolean isCancellable){
-        if(context_ == null) {
-            if (Countly.sharedInstance().isLoggingEnabled()) {
+        if(!isInitialized()) {
+            if (isLoggingEnabled()) {
                 Log.e(Countly.TAG, "Can't call this function before init has been called");
                 return this;
             }
         }
 
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Setting if star rating is cancellable: [" + isCancellable + "]");
         }
 
-        CountlyStarRating.setIfRatingDialogIsCancellable(context_, isCancellable);
+        moduleRatings.setIfRatingDialogIsCancellableInternal(connectionQueue_.getCountlyStore(), isCancellable);
 
         return this;
     }
@@ -2098,8 +1956,7 @@ public class Countly {
      * @deprecated use CountlyConfig during init to set this
      */
     public synchronized Countly setHttpPostForced(boolean isItForced) {
-
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Setting if HTTP POST is forced: [" + isItForced + "]");
         }
 
@@ -2129,9 +1986,10 @@ public class Countly {
     /**
      * Set if Countly SDK should ignore app crawlers
      * @param shouldIgnore if crawlers should be ignored
+     * @deprecated use CountlyConfig to set this
      */
     public synchronized Countly setShouldIgnoreCrawlers(boolean shouldIgnore){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Setting if should ignore app crawlers: [" + shouldIgnore + "]");
         }
         shouldIgnoreCrawlers = shouldIgnore;
@@ -2141,9 +1999,10 @@ public class Countly {
     /**
      * Add app crawler device name to the list of names that should be ignored
      * @param crawlerName the name to be ignored
+     * @deprecated use CountlyConfig to set this
      */
     public void addAppCrawlerName(String crawlerName) {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Adding app crawler name: [" + crawlerName + "]");
         }
         if(crawlerName != null && !crawlerName.isEmpty()) {
@@ -2195,7 +2054,7 @@ public class Countly {
      * @return
      */
     public synchronized Countly setPushIntentAddMetadata(boolean shouldAddMetadata) {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Setting if adding metadata to push intents: [" + shouldAddMetadata + "]");
         }
         addMetadataToPushIntents = shouldAddMetadata;
@@ -2208,7 +2067,7 @@ public class Countly {
      * @param shouldUseShortName set true if you want short names
      */
     public synchronized Countly setAutoTrackingUseShortName(boolean shouldUseShortName) {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Setting if automatic view tracking should use short names: [" + shouldUseShortName + "]");
         }
         automaticTrackingShouldUseShortName = shouldUseShortName;
@@ -2218,9 +2077,10 @@ public class Countly {
     /**
      * Set if attribution should be enabled
      * @param shouldEnableAttribution set true if you want to enable it, set false if you want to disable it
+     * @deprecated use CountlyConfig to set this
      */
     public synchronized Countly setEnableAttribution(boolean shouldEnableAttribution) {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Setting if attribution should be enabled");
         }
         isAttributionEnabled = shouldEnableAttribution;
@@ -2233,7 +2093,7 @@ public class Countly {
      * @return
      */
     public synchronized Countly setRequiresConsent(boolean shouldRequireConsent){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Setting if consent should be required, [" + shouldRequireConsent + "]");
         }
         requiresConsent = shouldRequireConsent;
@@ -2312,10 +2172,15 @@ public class Countly {
      * @param groupName name of the consent group
      * @param features array of feature to be added to the consent group
      * @return Returns link to Countly for call chaining
+     * @deprecated use 'Countly.sharedInstance().consent().createFeatureGroup'
      */
     public synchronized Countly createFeatureGroup(String groupName, String[] features){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Creating a feature group with the name: [" + groupName + "]");
+        }
+
+        if(isLoggingEnabled() && !isInitialized()){
+            Log.w(Countly.TAG, "Calling this before initialising the SDK is deprecated!");
         }
 
         groupedFeatures.put(groupName, features);
@@ -2327,14 +2192,19 @@ public class Countly {
      * @param groupName name of the consent group
      * @param isConsentGiven the value that should be set for this consent group
      * @return Returns link to Countly for call chaining
+     * @deprecated use 'Countly.sharedInstance().consent().setConsent'
      */
     public synchronized Countly setConsentFeatureGroup(String groupName, boolean isConsentGiven){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Setting consent for feature group named: [" + groupName + "] with value: [" + isConsentGiven + "]");
         }
 
+        if(isLoggingEnabled() && !isInitialized()){
+            Log.w(Countly.TAG, "Calling this before initialising the SDK is deprecated!");
+        }
+
         if(!groupedFeatures.containsKey(groupName)){
-            if (Countly.sharedInstance().isLoggingEnabled()) {
+            if (isLoggingEnabled()) {
                 Log.d(Countly.TAG, "Trying to set consent for a unknown feature group: [" + groupName + "]");
             }
 
@@ -2351,8 +2221,13 @@ public class Countly {
      * @param featureNames feature names for which consent should be changed
      * @param isConsentGiven the consent value that should be set
      * @return Returns link to Countly for call chaining
+     * @deprecated use 'Countly.sharedInstance().consent().setConsent' or set consent through CountlyConfig
      */
     public synchronized Countly setConsent(String[] featureNames, boolean isConsentGiven){
+        if(isLoggingEnabled() && !isInitialized()){
+            Log.w(Countly.TAG, "Calling this before initialising the SDK is deprecated!");
+        }
+
         final boolean isInit = isInitialized();//is the SDK initialized
 
         if(!requiresConsent){
@@ -2373,7 +2248,7 @@ public class Countly {
         boolean currentSessionConsent = previousSessionsConsent;
 
         for(String featureName:featureNames) {
-            if (Countly.sharedInstance() != null && Countly.sharedInstance().isLoggingEnabled()) {
+            if (Countly.sharedInstance() != null && isLoggingEnabled()) {
                 Log.d(Countly.TAG, "Setting consent for feature named: [" + featureName + "] with value: [" + isConsentGiven + "]");
             }
 
@@ -2425,7 +2300,9 @@ public class Countly {
                 //if consent was given, we need to begin the session
                 if(isBeginSessionSent){
                     //if the first timing for a beginSession call was missed, send it again
-                    onStartHelper();
+                    if(!moduleSessions.manualSessionControlEnabled){
+                        moduleSessions.beginSessionInternal();
+                    }
                 }
             }
         } else {
@@ -2441,11 +2318,17 @@ public class Countly {
      * Give the consent to a feature
      * @param featureNames the names of features for which consent should be given
      * @return Returns link to Countly for call chaining
+     * @deprecated use 'Countly.sharedInstance().consent().giveConsent(featureNames)' or set consent through CountlyConfig
      */
     public synchronized Countly giveConsent(String[] featureNames){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Giving consent for features named: [" + Arrays.toString(featureNames) + "]");
         }
+
+        if(isLoggingEnabled() && !isInitialized()){
+            Log.w(Countly.TAG, "Calling this before initialising the SDK is deprecated!");
+        }
+
         setConsent(featureNames, true);
 
         return this;
@@ -2455,10 +2338,15 @@ public class Countly {
      * Remove the consent of a feature
      * @param featureNames the names of features for which consent should be removed
      * @return Returns link to Countly for call chaining
+     * @deprecated use 'Countly.sharedInstance().consent().removeConsent(featureNames)'
      */
     public synchronized Countly removeConsent(String[] featureNames){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Removing consent for features named: [" + Arrays.toString(featureNames) + "]");
+        }
+
+        if(isLoggingEnabled() && !isInitialized()){
+            Log.w(Countly.TAG, "Calling this before initialising the SDK is deprecated!");
         }
 
         setConsent(featureNames, false);
@@ -2467,9 +2355,30 @@ public class Countly {
     }
 
     /**
+     * Remove consent for all features
+     * @return Returns link to Countly for call chaining
+     * @deprecated use 'Countly.sharedInstance().consent().removeConsentAll()'
+     */
+    public synchronized Countly removeConsentAll(){
+        if (isLoggingEnabled()) {
+            Log.d(Countly.TAG, "Removing consent for all features");
+        }
+
+        if(isLoggingEnabled() && !isInitialized()){
+            Log.w(Countly.TAG, "Calling this before initialising the SDK is deprecated!");
+        }
+
+        removeConsent(validFeatureNames);
+
+        return this;
+    }
+
+
+    /**
      * Get the current consent state of a feature
      * @param featureName the name of a feature for which consent should be checked
      * @return the consent value
+     * @deprecated use 'Countly.sharedInstance().consent().getConsent(featureName)'
      */
     public synchronized boolean getConsent(String featureName){
         if(!requiresConsent){
@@ -2485,7 +2394,7 @@ public class Countly {
 
                 boolean storedConsent = connectionQueue_.getCountlyStore().getConsentPush();
 
-                if (Countly.sharedInstance().isLoggingEnabled()) {
+                if (isLoggingEnabled()) {
                     Log.d(Countly.TAG, "Push consent has not been set this session. Setting the value found stored in preferences:[" + storedConsent + "]");
                 }
 
@@ -2497,7 +2406,7 @@ public class Countly {
             }
         }
 
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Returning consent for feature named: [" + featureName + "] [" + returnValue + "]");
         }
 
@@ -2507,13 +2416,14 @@ public class Countly {
     /**
      * Print the consent values of all features
      * @return Returns link to Countly for call chaining
+     * @deprecated use 'Countly.sharedInstance().consent().checkAllConsent()'
      */
-    public synchronized Countly checkAllConsent(){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+    public synchronized Countly checkAllConsent() {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Checking and printing consent for All features");
         }
 
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Is consent required? [" + requiresConsent + "]");
         }
 
@@ -2526,7 +2436,7 @@ public class Countly {
             sb.append("Feature named [").append(key).append("], consent value: [").append(featureConsentValues.get(key)).append("]\n");
         }
 
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, sb.toString());
         }
 
@@ -2536,6 +2446,7 @@ public class Countly {
     /**
      * Returns true if any consent has been given
      * @return true - any consent has been given, false - no consent has been given
+     * todo move to module
      */
     protected boolean anyConsentGiven(){
         if (!requiresConsent){
@@ -2555,13 +2466,23 @@ public class Countly {
      * Show the rating dialog to the user
      * @param widgetId ID that identifies this dialog
      * @return
+     * @deprecated use 'Countly.sharedInstance().remoteConfig().showFeedbackPopup'
      */
-    public synchronized Countly showFeedbackPopup(final String widgetId, final String closeButtonText, final Activity activity, final CountlyStarRating.FeedbackRatingCallback callback){
+    public synchronized Countly showFeedbackPopup(final String widgetId, final String closeButtonText, final Activity activity, final CountlyStarRating.FeedbackRatingCallback feedbackCallback){
         if (!isInitialized()) {
             throw new IllegalStateException("Countly.sharedInstance().init must be called before showFeedbackPopup");
         }
 
-        CountlyStarRating.showFeedbackPopup(widgetId, closeButtonText, activity, this, connectionQueue_, callback);
+        if(feedbackCallback == null) {
+            ratings().showFeedbackPopup(widgetId, closeButtonText, activity, null);
+        } else {
+            ratings().showFeedbackPopup(widgetId, closeButtonText, activity, new FeedbackRatingCallback() {
+                @Override
+                public void callback(String error) {
+                    feedbackCallback.callback(error);
+                }
+            });
+        }
 
         return this;
     }
@@ -2570,103 +2491,134 @@ public class Countly {
      * If enable, will automatically download newest remote config_ values on init.
      * @deprecated use CountlyConfig during init to set this
      * @param enabled set true for enabling it
-     * @param callback callback called after the update was done
+     * @param feedbackCallback callback called after the update was done
      * @return
      */
-    public synchronized Countly setRemoteConfigAutomaticDownload(boolean enabled, RemoteConfig.RemoteConfigCallback callback){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+    public synchronized Countly setRemoteConfigAutomaticDownload(boolean enabled, final RemoteConfig.RemoteConfigCallback feedbackCallback){
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Setting if remote config_ Automatic download will be enabled, " + enabled);
         }
 
         remoteConfigAutomaticUpdateEnabled = enabled;
-        remoteConfigInitCallback = callback;
+
+        if(feedbackCallback != null) {
+            remoteConfigInitCallback = new RemoteConfigCallback() {
+                @Override
+                public void callback(String error) {
+                    feedbackCallback.callback(error);
+                }
+            };
+        }
         return this;
     }
 
     /**
      * Manually update remote config_ values
-     * @param callback
+     * @param providedCallback
+     * @deprecated use 'Countly.sharedInstance().remoteConfig().update(callback)'
      */
-    public void remoteConfigUpdate(RemoteConfig.RemoteConfigCallback callback){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+    public void remoteConfigUpdate(final RemoteConfig.RemoteConfigCallback providedCallback) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Manually calling to updateRemoteConfig");
         }
         if (!isInitialized()) {
             throw new IllegalStateException("Countly.sharedInstance().init must be called before remoteConfigUpdate");
         }
-        if(!anyConsentGiven()){ return; }
-        RemoteConfig.updateRemoteConfigValues(context_, null, null, connectionQueue_, false, callback);
+
+        if(providedCallback == null) {
+            remoteConfig().update(null);
+        } else {
+            remoteConfig().update(new RemoteConfigCallback() {
+                @Override
+                public void callback(String error) {
+                    providedCallback.callback(error);
+                }
+            });
+        }
     }
 
     /**
      * Manual remote config_ update call. Will only update the keys provided.
      * @param keysToInclude
-     * @param callback
+     * @param providedCallback
+     * @deprecated use 'Countly.sharedInstance().remoteConfig().updateForKeysOnly(keys, callback)'
      */
-    public void updateRemoteConfigForKeysOnly(String[] keysToInclude, RemoteConfig.RemoteConfigCallback callback){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+    public void updateRemoteConfigForKeysOnly(String[] keysToInclude, final RemoteConfig.RemoteConfigCallback providedCallback){
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Manually calling to updateRemoteConfig with include keys");
         }
         if (!isInitialized()) {
             throw new IllegalStateException("Countly.sharedInstance().init must be called before updateRemoteConfigForKeysOnly");
         }
-        if(!anyConsentGiven()){
-            if(callback != null){ callback.callback("No consent given"); }
-            return;
+
+        if(providedCallback == null) {
+            remoteConfig().updateForKeysOnly(keysToInclude, null);
+        } else {
+            remoteConfig().updateForKeysOnly(keysToInclude, new RemoteConfigCallback() {
+                @Override
+                public void callback(String error) {
+                    providedCallback.callback(error);
+                }
+            });
         }
-        if (keysToInclude == null && Countly.sharedInstance().isLoggingEnabled()) { Log.w(Countly.TAG,"updateRemoteConfigExceptKeys passed 'keys to include' array is null"); }
-        RemoteConfig.updateRemoteConfigValues(context_, keysToInclude, null, connectionQueue_, false, callback);
     }
 
     /**
      * Manual remote config_ update call. Will update all keys except the ones provided
      * @param keysToExclude
-     * @param callback
+     * @param providedCallback
+     * @deprecated use 'Countly.sharedInstance().remoteConfig().updateExceptKeys(keys, callback)'
      */
-    public void updateRemoteConfigExceptKeys(String[] keysToExclude, RemoteConfig.RemoteConfigCallback callback) {
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+    public void updateRemoteConfigExceptKeys(String[] keysToExclude, final RemoteConfig.RemoteConfigCallback providedCallback) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Manually calling to updateRemoteConfig with exclude keys");
         }
         if (!isInitialized()) {
             throw new IllegalStateException("Countly.sharedInstance().init must be called before updateRemoteConfigExceptKeys");
         }
-        if(!anyConsentGiven()){
-            if(callback != null){ callback.callback("No consent given"); }
-            return;
+
+        if(providedCallback == null) {
+            remoteConfig().updateExceptKeys(keysToExclude, null);
+        } else {
+            remoteConfig().updateExceptKeys(keysToExclude, new RemoteConfigCallback() {
+                @Override
+                public void callback(String error) {
+                    providedCallback.callback(error);
+                }
+            });
         }
-        if (keysToExclude == null && Countly.sharedInstance().isLoggingEnabled()) { Log.w(Countly.TAG,"updateRemoteConfigExceptKeys passed 'keys to ignore' array is null"); }
-        RemoteConfig.updateRemoteConfigValues(context_, null, keysToExclude, connectionQueue_, false, callback);
     }
 
     /**
      * Get the stored value for the provided remote config_ key
      * @param key
      * @return
+     * @deprecated use 'Countly.sharedInstance().remoteConfig().getValueForKey(key)'
      */
     public Object getRemoteConfigValueForKey(String key){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Calling remoteConfigValueForKey");
         }
         if (!isInitialized()) {
             throw new IllegalStateException("Countly.sharedInstance().init must be called before remoteConfigValueForKey");
         }
-        if(!anyConsentGiven()) { return null; }
 
-        return RemoteConfig.getValue(key, context_);
+        return remoteConfig().getValueForKey(key);
     }
 
     /**
      * Clear all stored remote config_ values
+     * @deprecated use 'Countly.sharedInstance().remoteConfig().clearStoredValues();'
      */
     public void remoteConfigClearValues(){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Calling remoteConfigClearValues");
         }
         if (!isInitialized()) {
             throw new IllegalStateException("Countly.sharedInstance().init must be called before remoteConfigClearValues");
         }
 
-        RemoteConfig.clearValueStore(context_);
+        remoteConfig().clearStoredValues();
     }
 
     /**
@@ -2674,7 +2626,7 @@ public class Countly {
      * @deprecated use CountlyConfig during init to set this
      */
     public void addCustomNetworkRequestHeaders(Map<String, String> headerValues){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Calling addCustomNetworkRequestHeaders");
         }
         requestHeaderCustomValues = headerValues;
@@ -2689,7 +2641,7 @@ public class Countly {
      * Call only if you don't need that information
      */
     public void flushRequestQueues(){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Calling flushRequestQueues");
         }
 
@@ -2712,7 +2664,7 @@ public class Countly {
             count++;
         }
 
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "flushRequestQueues removed [" + count + "] requests");
         }
     }
@@ -2720,8 +2672,8 @@ public class Countly {
     /**
      * Countly will attempt to fulfill all stored requests on demand
      */
-    public void doStoredRequests(){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
+    public void doStoredRequests() {
+        if (isLoggingEnabled()) {
             Log.d(Countly.TAG, "Calling doStoredRequests");
         }
 
@@ -2732,82 +2684,92 @@ public class Countly {
         connectionQueue_.tick();
     }
 
-/*
-    public Countly offlineModeEnable(){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
-            Log.d(Countly.TAG, "Calling offlineModeEnable");
+    public Countly enableTemporaryIdMode() {
+        if (isLoggingEnabled()) {
+            Log.d(Countly.TAG, "Calling enableTemporaryIdMode");
         }
+
+        changeDeviceId(DeviceId.temporaryCountlyDeviceId);
+
+        return this;
     }
 
-    public Countly offlineModeDisable(){
-        if (Countly.sharedInstance().isLoggingEnabled()) {
-            Log.d(Countly.TAG, "Calling offlineModeDisable");
+    public ModuleCrash.Crashes crashes() {
+        if (!isInitialized()) {
+            throw new IllegalStateException("Countly.sharedInstance().init must be called before accessing crashes");
         }
+
+        return moduleCrash.crashesInterface;
     }
-*/
+
+    public ModuleEvents.Events events() {
+        if (!isInitialized()) {
+            throw new IllegalStateException("Countly.sharedInstance().init must be called before accessing events");
+        }
+
+        return moduleEvents.eventsInterface;
+    }
+
+    public ModuleViews.Views views() {
+        if (!isInitialized()) {
+            throw new IllegalStateException("Countly.sharedInstance().init must be called before accessing views");
+        }
+
+        return moduleViews.viewsInterface;
+    }
+
+    public ModuleRatings.Ratings ratings() {
+        if (!isInitialized()) {
+            throw new IllegalStateException("Countly.sharedInstance().init must be called before accessing ratings");
+        }
+
+        return moduleRatings.ratingsInterface;
+    }
+
+    public ModuleSessions.Sessions sessions(){
+        if (!isInitialized()) {
+            throw new IllegalStateException("Countly.sharedInstance().init must be called before accessing sessions");
+        }
+
+        return moduleSessions.sessionInterface;
+    }
+
+    public ModuleRemoteConfig.RemoteConfig remoteConfig() {
+        if (!isInitialized()) {
+            throw new IllegalStateException("Countly.sharedInstance().init must be called before accessing remote config");
+        }
+
+        return moduleRemoteConfig.remoteConfigInterface;
+    }
+
+    public ModuleAPM.Apm apm() {
+        if (!isInitialized()) {
+            throw new IllegalStateException("Countly.sharedInstance().init must be called before accessing apm");
+        }
+
+        return moduleAPM.apmInterface;
+    }
+
+    public ModuleConsent.Consent consent() {
+        if (!isInitialized()) {
+            throw new IllegalStateException("Countly.sharedInstance().init must be called before accessing consent");
+        }
+
+        return moduleConsent.consentInterface;
+    }
+
+    public static void applicationOnCreate() {
+        applicationStart = UtilsTime.currentTimestampMs();
+    }
+
     // for unit testing
     ConnectionQueue getConnectionQueue() { return connectionQueue_; }
     void setConnectionQueue(final ConnectionQueue connectionQueue) { connectionQueue_ = connectionQueue; }
     ExecutorService getTimerService() { return timerService_; }
     EventQueue getEventQueue() { return eventQueue_; }
     void setEventQueue(final EventQueue eventQueue) { eventQueue_ = eventQueue; }
-    long getPrevSessionDurationStartTime() { return prevSessionDurationStartTime_; }
-    void setPrevSessionDurationStartTime(final long prevSessionDurationStartTime) { prevSessionDurationStartTime_ = prevSessionDurationStartTime; }
+    long getPrevSessionDurationStartTime() { return moduleSessions.prevSessionDurationStartTime_; }
+    void setPrevSessionDurationStartTime(final long prevSessionDurationStartTime) { moduleSessions.prevSessionDurationStartTime_ = prevSessionDurationStartTime; }
     int getActivityCount() { return activityCount_; }
     synchronized boolean getDisableUpdateSessionRequests() { return disableUpdateSessionRequests_; }
-
-    @SuppressWarnings("InfiniteRecursion")
-    public void stackOverflow() {
-        this.stackOverflow();
-    }
-
-    @SuppressWarnings("ConstantConditions")
-    public synchronized Countly crashTest(int crashNumber) {
-
-        if (crashNumber == 1){
-            if (Countly.sharedInstance().isLoggingEnabled()) {
-                Log.d(Countly.TAG, "Running crashTest 1");
-            }
-
-            stackOverflow();
-
-        }else if (crashNumber == 2){
-
-            if (Countly.sharedInstance().isLoggingEnabled()) {
-                Log.d(Countly.TAG, "Running crashTest 2");
-            }
-
-            //noinspection UnusedAssignment,divzero
-            @SuppressWarnings("NumericOverflow") int test = 10/0;
-
-        }else if (crashNumber == 3){
-
-            if (Countly.sharedInstance().isLoggingEnabled()) {
-                Log.d(Countly.TAG, "Running crashTest 3");
-            }
-
-            Object[] o = null;
-            //noinspection InfiniteLoopStatement
-            while (true) { o = new Object[] { o }; }
-
-
-        }else if (crashNumber == 4){
-
-            if (Countly.sharedInstance().isLoggingEnabled()) {
-                Log.d(Countly.TAG, "Running crashTest 4");
-            }
-
-            throw new RuntimeException("This is a crash");
-        }
-        else{
-            if (Countly.sharedInstance().isLoggingEnabled()) {
-                Log.d(Countly.TAG, "Running crashTest 5");
-            }
-
-            String test = null;
-            //noinspection ResultOfMethodCallIgnored
-            test.charAt(1);
-        }
-        return Countly.sharedInstance();
-    }
 }

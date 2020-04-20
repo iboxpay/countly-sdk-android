@@ -1,6 +1,6 @@
 package ly.count.android.sdk;
 
-import android.support.test.runner.AndroidJUnit4;
+import androidx.test.ext.junit.runners.AndroidJUnit4;
 
 import org.json.JSONException;
 import org.junit.Before;
@@ -11,18 +11,18 @@ import org.junit.runner.RunWith;
 public class RemoteConfigTests {
 
     @Before
-    public void setUp() {
-
+    public void setUp(){
+        Countly.sharedInstance().setLoggingEnabled(true);
     }
 
     @Test
     public void testSerializeDeserialize() throws JSONException {
-        RemoteConfig.RemoteConfigValueStore remoteConfigValueStore = RemoteConfig.RemoteConfigValueStore.dataFromString(null);
+        ModuleRemoteConfig.RemoteConfigValueStore remoteConfigValueStore = ModuleRemoteConfig.RemoteConfigValueStore.dataFromString(null);
 
         remoteConfigValueStore.values.put("fd", 12);
         remoteConfigValueStore.values.put("2fd", 142);
         remoteConfigValueStore.values.put("f3d", 123);
 
-        RemoteConfig.RemoteConfigValueStore.dataFromString(remoteConfigValueStore.dataToString());
+        ModuleRemoteConfig.RemoteConfigValueStore.dataFromString(remoteConfigValueStore.dataToString());
     }
 }

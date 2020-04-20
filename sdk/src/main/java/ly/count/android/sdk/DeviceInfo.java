@@ -120,35 +120,19 @@ class DeviceInfo {
                 densityStr = "HDPI";
                 break;
             case DisplayMetrics.DENSITY_260:
-                densityStr = "XHDPI";
-                break;
             case DisplayMetrics.DENSITY_280:
-                densityStr = "XHDPI";
-                break;
             case DisplayMetrics.DENSITY_300:
-                densityStr = "XHDPI";
-                break;
             case DisplayMetrics.DENSITY_XHIGH:
                 densityStr = "XHDPI";
                 break;
             case DisplayMetrics.DENSITY_340:
-                densityStr = "XXHDPI";
-                break;
             case DisplayMetrics.DENSITY_360:
-                densityStr = "XXHDPI";
-                break;
             case DisplayMetrics.DENSITY_400:
-                densityStr = "XXHDPI";
-                break;
             case DisplayMetrics.DENSITY_420:
-                densityStr = "XXHDPI";
-                break;
             case DisplayMetrics.DENSITY_XXHIGH:
                 densityStr = "XXHDPI";
                 break;
             case DisplayMetrics.DENSITY_560:
-                densityStr = "XXXHDPI";
-                break;
             case DisplayMetrics.DENSITY_XXXHIGH:
                 densityStr = "XXXHDPI";
                 break;
@@ -201,7 +185,10 @@ class DeviceInfo {
     static String getAppVersion(final Context context) {
         String result = Countly.DEFAULT_APP_VERSION;
         try {
-            result = context.getPackageManager().getPackageInfo(context.getPackageName(), 0).versionName;
+            String tmpVersion = context.getPackageManager().getPackageInfo(context.getPackageName(), 0).versionName;
+            if(tmpVersion != null){
+                result = tmpVersion;
+            }
         }
         catch (PackageManager.NameNotFoundException e) {
             if (Countly.sharedInstance().isLoggingEnabled()) {

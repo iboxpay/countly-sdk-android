@@ -161,6 +161,13 @@ public class CountlyStore {
         }
     }
 
+    protected synchronized void replaceConnections(final String[] newConns){
+        if(newConns != null){
+            final List<String> connections = new ArrayList<>(Arrays.asList(newConns));
+            preferences_.edit().putString(CONNECTIONS_PREFERENCE, join(connections, DELIMITER)).apply();
+        }
+    }
+
     /**
      * Adds a custom event to the local store.
      * @param event event to be added to the local store, must not be null
@@ -269,12 +276,13 @@ public class CountlyStore {
      * @param sum sum associated with the custom event, if not used, pass zero.
      *            NaN and infinity values will be quietly ignored.
      */
-    public synchronized void addEvent(final String key, final Map<String, String> segmentation, final Map<String, Integer> segmentationInt, final Map<String, Double> segmentationDouble, final long timestamp, final int hour, final int dow, final int count, final double sum, final double dur) {
+    public synchronized void addEvent(final String key, final Map<String, String> segmentation, final Map<String, Integer> segmentationInt, final Map<String, Double> segmentationDouble, final Map<String, Boolean> segmentationBoolean, final long timestamp, final int hour, final int dow, final int count, final double sum, final double dur) {
         final Event event = new Event();
         event.key = key;
         event.segmentation = segmentation;
         event.segmentationDouble = segmentationDouble;
         event.segmentationInt = segmentationInt;
+        event.segmentationBoolean = segmentationBoolean;
         event.timestamp = timestamp;
         event.hour = hour;
         event.dow = dow;
