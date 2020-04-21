@@ -23,6 +23,8 @@ package ly.count.android.sdk;
 
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.net.ConnectivityManager;
+import android.net.NetworkInfo;
 import android.telephony.TelephonyManager;
 import android.util.DisplayMetrics;
 import android.util.Log;
@@ -165,6 +167,67 @@ class DeviceInfo {
         return carrier;
     }
 
+    /**
+     * Returns the display name of the current network type from the
+     * TelephonyManager and ConnectivityManager from the specified context.
+     * @param context to use to retrieve the TelephonyManager and ConnectivityManager from
+     * @return the display name of the current network type, or the unknown
+     *         string if it cannot be accessed or determined
+     */
+    static String getNetworkType(final Context context) {
+        String networkType = "unknown";
+        final ConnectivityManager connectivityManager =
+                (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+
+        NetworkInfo activeNetInfo = connectivityManager.getActiveNetworkInfo();
+        if (activeNetInfo == null || !activeNetInfo.isAvailable()) {
+            return "none";
+        }
+
+        NetworkInfo wifiInfo = connectivityManager.getNetworkInfo(ConnectivityManager.TYPE_WIFI);
+        if (null != wifiInfo) {
+            NetworkInfo.State state = wifiInfo.getState();
+            if (null != state) {
+                if (state == NetworkInfo.State.CONNECTED || state == NetworkInfo.State.CONNECTING) {
+                    return "wifi";
+                }
+            }
+        }
+
+        final TelephonyManager manager = (TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE);
+        if (manager == null) {
+            return networkType;
+        }
+
+        switch (manager.getNetworkType()) {
+            case TelephonyManager.NETWORK_TYPE_GPRS:
+            case TelephonyManager.NETWORK_TYPE_CDMA:
+            case TelephonyManager.NETWORK_TYPE_EDGE:
+            case TelephonyManager.NETWORK_TYPE_1xRTT:
+            case TelephonyManager.NETWORK_TYPE_IDEN:
+                networkType = "2G";
+                break;
+            case TelephonyManager.NETWORK_TYPE_EVDO_A:
+            case TelephonyManager.NETWORK_TYPE_UMTS:
+            case TelephonyManager.NETWORK_TYPE_EVDO_0:
+            case TelephonyManager.NETWORK_TYPE_HSDPA:
+            case TelephonyManager.NETWORK_TYPE_HSUPA:
+            case TelephonyManager.NETWORK_TYPE_HSPA:
+            case TelephonyManager.NETWORK_TYPE_EVDO_B:
+            case TelephonyManager.NETWORK_TYPE_EHRPD:
+            case TelephonyManager.NETWORK_TYPE_HSPAP:
+                networkType = "3G";
+                break;
+            case TelephonyManager.NETWORK_TYPE_LTE:
+                networkType = "4G";
+                break;
+            default:
+                networkType = "none";
+                break;
+        }
+        return networkType;
+    }
+
     static int getTimezoneOffset() {
         return TimeZone.getDefault().getOffset(new Date().getTime()) / 60000;
     }
@@ -238,6 +301,7 @@ class DeviceInfo {
                 "_locale", getLocale(),
                 "_app_version", getAppVersion(context),
                 "_store", getStore(context),
+                "_network_type", getNetworkType(context),
                 "_deep_link", deepLink);
 
         String result = json.toString();
